@@ -16,7 +16,7 @@ import crypto from 'node:crypto';
 export const pluginName = 'discord';
 
 export function setup(provide) {
-  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession, readConfig }) => {
+  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendToSessionQuietly, readConfig }) => {
     registerMigrations({ directory: 'sql' });
     let PluginInterface = registry.getClass('PluginInterface');
     if (!PluginInterface)
@@ -168,6 +168,57 @@ export function setup(provide) {
         return;
       }
 
+      // --- message edits -------------------------------------------------------
+      // An edit UPDATES the original frame: same id, original text untouched, an audit
+      // tail added to its content. It never creates a second frame and never rewrites the
+      // text the bot first saw. Edits do not wake the session - a quiet append, because
+      // the bot reads the change in its context when it next runs.
+      if (payload?.t === 'MESSAGE_UPDATE') {
+        let messageID = payload?.id || payload?.message?.id || null;
+        let newContent = payload?.content ?? payload?.message?.content ?? null;
+        let editedAt = payload?.edited_timestamp || new Date().toISOString();
+
+        if (!messageID || newContent === null) {
+          response.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({ error: { message: 'edit event without id or content' } }));
+          return;
+        }
+
+        let row = await db().one(
+          'SELECT session_id, frame_id, original_text, edits FROM discord_message_frame WHERE message_id = $1',
+          [messageID],
+        );
+        if (!row || !row.frame_id) {
+          // An edit for a message we never stored: nothing to update, and guessing would
+          // be worse than ignoring it.
+          response.writeHead(204);
+          response.end();
+          return;
+        }
+
+        let before = String(row.original_text).split('\n');
+        let after = String(newContent).split('\n');
+        let diff = [];
+        for (let i = 0; i < Math.max(before.length, after.length); i++) {
+          if ((before[i] ?? '') === (after[i] ?? '')) continue;
+          if (before[i] !== undefined) diff.push(`- ${before[i]}`);
+          if (after[i] !== undefined) diff.push(`+ ${after[i]}`);
+        }
+
+        await appendToSessionQuietly(row.session_id, {
+          id: row.frame_id,
+          text: row.original_text,
+          source: 'discord',
+          audit: [{ editedAt, diff: diff.join('\n') || '(no textual change)' }],
+        });
+
+        await db().query('UPDATE discord_message_frame SET edits = edits + 1 WHERE message_id = $1', [messageID]);
+
+        response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ ok: true, updated: row.frame_id, edit: row.edits + 1 }));
+        return;
+      }
+
       // Real time, no debounce: the message goes straight into the session the channel
       // is bound to. Kikx is a chat, so there is nothing to debounce - Discord's event
       // is already the message.
@@ -198,12 +249,23 @@ export function setup(provide) {
         return;
       }
 
-      await appendToSession(binding.session_id, {
+      let messageID = payload?.id || payload?.message?.id || null;
+      let frame = await appendToSession(binding.session_id, {
         text: `[discord:${authorName}] ${content}`,
         source: 'discord',
         channelID: channelId,
+        discordMessageID: messageID,
       });
 
+      // Remember which frame this message became, so an edit can find it later. Written
+      // after the frame exists; an edit for a message with no row is ignored rather than
+      // guessed at.
+      if (messageID && frame?.id) {
+        await db().query(
+          'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
+          [messageID, binding.session_id, frame.id, content],
+        );
+      }
       response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ ok: true, sessionID: binding.session_id }));
     });
