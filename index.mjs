@@ -115,6 +115,28 @@ export function setup(provide) {
 
     registry.registerTool('discord:send', SendTool);
 
+    // --- gateway -------------------------------------------------------------
+    // Interactions arrive over HTTP, but ordinary channel messages only arrive over the
+    // gateway websocket. Without it, a Discord channel is a one-way transport: replies
+    // reach Discord, messages from Discord do not reach the session.
+    let socket = null;
+    let heartbeat = null;
+    let sequence = null;
+    let stopped = false;
+
+    async function gatewayLoop() {
+      let token = await readConfig('/kikx/discord/bot/token', null);
+      if (!token) {
+        // No token: say so once and stop. Reconnect-spinning on a missing credential is
+        // how a plugin becomes a log flood.
+        console.warn('[discord] gateway not started: no bot token configured');
+        return;
+      }
+      // Real implementation lives behind this. It must not be faked: a gateway that
+      // reports "connected" without a socket is worse than one that refuses.
+      console.warn('[discord] gateway implementation pending');
+    }
+
     mountHttp(async ({ request, response, rawBody, json, subPath }) => {
       if (request.method !== 'POST' || subPath !== '/interactions') {
         response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -185,5 +207,17 @@ export function setup(provide) {
       response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ ok: true, sessionID: binding.session_id }));
     });
+
+    // Returned as an object, not a function: loadPlugins treats a returned function as a
+    // teardown and would silently skip onInit and onShutdown.
+    return {
+      onInit() { return gatewayLoop(); },
+      onShutdown() {
+        stopped = true;
+        if (heartbeat) clearInterval(heartbeat);
+        if (socket && typeof socket.close === 'function') socket.close();
+        socket = null;
+      },
+    };
   });
 }
