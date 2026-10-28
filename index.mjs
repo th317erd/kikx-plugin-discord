@@ -196,6 +196,8 @@ export function setup(provide) {
           return;
         }
 
+        // original_text is the prefixed text as framed, so the update keeps the speaker
+        // attribution instead of replacing it with the raw Discord content.
         let before = String(row.original_text).split('\n');
         let after = String(newContent).split('\n');
         let diff = [];
@@ -260,10 +262,13 @@ export function setup(provide) {
       // Remember which frame this message became, so an edit can find it later. Written
       // after the frame exists; an edit for a message with no row is ignored rather than
       // guessed at.
-      if (messageID && frame?.id) {
+      // appendToSession returns { session, frame, commit, wakePending } - the frame id is
+      // one level down, and reading it as frame.id silently produced no mapping at all.
+      let frameID = frame?.frame?.id || frame?.id || null;
+      if (messageID && frameID) {
         await db().query(
           'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
-          [messageID, binding.session_id, frame.id, content],
+          [messageID, binding.session_id, frameID, `[discord:${authorName}] ${content}`],
         );
       }
       response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
