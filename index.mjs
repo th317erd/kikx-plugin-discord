@@ -16,7 +16,7 @@ import crypto from 'node:crypto';
 export const pluginName = 'discord';
 
 export function setup(provide) {
-  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession }) => {
+  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession, readConfig }) => {
     registerMigrations({ directory: 'sql' });
     let PluginInterface = registry.getClass('PluginInterface');
     if (!PluginInterface)
@@ -67,7 +67,7 @@ export function setup(provide) {
         if (!verdict.allowed)
           return { sent: false, denied: true, reason: verdict.reason };
 
-        let token = process.env.KIKX_DISCORD_BOT_TOKEN || null;
+        let token = await readConfig('/kikx/discord/bot/token', null);
         if (!token) {
           // Authorised but unable to deliver. Saying so is the only honest answer: a
           // "sent" that did not send is worse than a refusal.
@@ -128,7 +128,7 @@ export function setup(provide) {
       try { payload = json(); } catch (_e) { payload = null; }
 
       let verdict = verifySignature({
-        publicKey: process.env.KIKX_DISCORD_PUBLIC_KEY || null,
+        publicKey: await readConfig('/kikx/discord/public/key', null),
         signature: request.headers['x-signature-ed25519'],
         timestamp: request.headers['x-signature-timestamp'],
         rawBody,
