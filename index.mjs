@@ -16,7 +16,8 @@ import crypto from 'node:crypto';
 export const pluginName = 'discord';
 
 export function setup(provide) {
-  return provide(({ registry, mountHttp, authorize }) => {
+  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession }) => {
+    registerMigrations({ directory: 'sql' });
     let PluginInterface = registry.getClass('PluginInterface');
     if (!PluginInterface)
       throw new Error('kikx-plugin-discord requires PluginInterface in plugin context');
@@ -26,7 +27,13 @@ export function setup(provide) {
       if (!publicKey) return { ok: false, reason: 'no public key configured' };
       if (!signature || !timestamp) return { ok: false, reason: 'missing signature headers' };
       try {
-        let key = crypto.createPublicKey({ key: Buffer.from(publicKey, 'hex'), format: 'der', type: 'spki' });
+        // Discord supplies the raw 32-byte Ed25519 key. Node needs a complete SPKI
+        // structure, so the key is wrapped in the fixed Ed25519 SPKI prefix first.
+        let raw = Buffer.from(publicKey, 'hex');
+        let spki = raw.length === 32
+          ? Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), raw])
+          : raw;
+        let key = crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' });
         let ok = crypto.verify(null, Buffer.concat([Buffer.from(timestamp), rawBody]), key, Buffer.from(signature, 'hex'));
         return { ok };
       } catch (error) {
@@ -139,8 +146,44 @@ export function setup(provide) {
         return;
       }
 
+      // Real time, no debounce: the message goes straight into the session the channel
+      // is bound to. Kikx is a chat, so there is nothing to debounce - Discord's event
+      // is already the message.
+      let channelId = payload?.channel_id || payload?.channel?.id || null;
+      let content = payload?.data?.options?.find?.((o) => o.name === 'message')?.value
+        || payload?.data?.content || payload?.content || null;
+      let authorName = payload?.member?.user?.username || payload?.author?.username || 'discord';
+
+      if (!channelId) {
+        response.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ error: { message: 'no channel_id in payload' } }));
+        return;
+      }
+
+      let binding = await db().one(
+        'SELECT session_id FROM discord_channel_session WHERE channel_id = $1',
+        [channelId],
+      );
+      if (!binding) {
+        response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ error: { message: `channel ${channelId} is not bound to a session` } }));
+        return;
+      }
+
+      if (!content) {
+        response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ ok: true, note: 'no message content to append' }));
+        return;
+      }
+
+      await appendToSession(binding.session_id, {
+        text: `[discord:${authorName}] ${content}`,
+        source: 'discord',
+        channelID: channelId,
+      });
+
       response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
-      response.end(JSON.stringify({ ok: true }));
+      response.end(JSON.stringify({ ok: true, sessionID: binding.session_id }));
     });
   });
 }
