@@ -185,9 +185,10 @@ export function setup(provide) {
         }
 
         let row = await db().one(
-          'SELECT session_id, frame_id, original_text, edits FROM discord_message_frame WHERE message_id = $1',
+          'SELECT session_id, frame_id, original_text, edits, audit FROM discord_message_frame WHERE message_id = $1',
           [messageID],
         );
+        let existingAudit = Array.isArray(row?.audit) ? row.audit : [];
         if (!row || !row.frame_id) {
           // An edit for a message we never stored: nothing to update, and guessing would
           // be worse than ignoring it.
@@ -207,14 +208,28 @@ export function setup(provide) {
           if (after[i] !== undefined) diff.push(`+ ${after[i]}`);
         }
 
+        let entry = {
+          editedAt,
+          diff: diff.join('\n') || '(no textual change)',
+        };
+
+        // Accumulate: the tail grows with every edit. There is no frame reader on the
+        // plugin context, so the transport keeps its own record in the mapping table -
+        // it owns that row and reading it back is unambiguous.
+
         await appendToSessionQuietly(row.session_id, {
           id: row.frame_id,
           text: row.original_text,
           source: 'discord',
-          audit: [{ editedAt, diff: diff.join('\n') || '(no textual change)' }],
+          // The audit tail must ride inside content: buildUserMessageContent only keeps
+          // extra fields from input.content, so a top-level audit was silently dropped.
+          content: { audit: [...existingAudit, entry] },
         });
 
-        await db().query('UPDATE discord_message_frame SET edits = edits + 1 WHERE message_id = $1', [messageID]);
+        await db().query(
+          'UPDATE discord_message_frame SET edits = edits + 1, audit = $2::jsonb WHERE message_id = $1',
+          [messageID, JSON.stringify([...existingAudit, entry])],
+        );
 
         response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ ok: true, updated: row.frame_id, edit: row.edits + 1 }));
