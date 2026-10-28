@@ -1,0 +1,10 @@
+{
+  "name": "kikx-plugin-discord",
+  "version": "0.1.0",
+  "description": "Discord transport for Kikx",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {}
+}

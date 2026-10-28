@@ -1,0 +1,6 @@
+{
+  "name": "kikx-plugin-discord",
+  "version": "0.1.0",
+  "description": "Discord transport for Kikx: interactions, webhooks, and send with capability checks",
+  "kikxVersion": ">=0.1.0"
+}
