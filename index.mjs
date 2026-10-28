@@ -60,15 +60,48 @@ export function setup(provide) {
         if (!verdict.allowed)
           return { sent: false, denied: true, reason: verdict.reason };
 
-        // No gateway credentials yet: this reports the decision rather than pretending
-        // to deliver. Wiring Discord's REST API is the next step, and it must not be
-        // faked - a "sent" that did not send is worse than a refusal.
+        let token = process.env.KIKX_DISCORD_BOT_TOKEN || null;
+        if (!token) {
+          // Authorised but unable to deliver. Saying so is the only honest answer: a
+          // "sent" that did not send is worse than a refusal.
+          return {
+            sent: false,
+            denied: false,
+            authorized: true,
+            pending: 'no-bot-token',
+            note: 'KIKX_DISCORD_BOT_TOKEN is not configured',
+          };
+        }
+
+        let channelId = String(params.channel).replace(/^#/, '');
+        let res;
+        try {
+          res = await fetch(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bot ${token}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
+            },
+            body: JSON.stringify({ content: String(params.content).slice(0, 2000) }),
+          });
+        } catch (error) {
+          return { sent: false, authorized: true, error: String(error?.message || error) };
+        }
+
+        if (!res.ok) {
+          let detail = await res.text().catch(() => '');
+          return { sent: false, authorized: true, status: res.status, error: detail.slice(0, 300) };
+        }
+
+        let body = await res.json().catch(() => null);
         return {
-          sent: false,
-          denied: false,
+          sent: true,
           authorized: true,
-          pending: 'transport-not-wired',
-          note: 'capability check passed; Discord API delivery is not implemented yet',
+          channel: channelId,
+          messageID: body?.id || null,
+          // Discord returns 200; a message id is the only proof it existed.
+          delivered: Boolean(body?.id),
         };
       }
     }
