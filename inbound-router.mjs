@@ -15,6 +15,10 @@
 // (joins, pins, boosts, calls) has no text worth framing.
 const FRAMEABLE_MESSAGE_TYPES = new Set([0, 19]);
 
+// A newline, named rather than written as an escape inline. The diff below splits
+// message text on it, and an inline escape is exactly what got mis-quoted twice.
+const NEWLINE = String.fromCharCode(10);
+
 export class DiscordInboundRouter {
   // options:
   //   findChannelSession  async (channelID) => { session_id } | null
@@ -31,6 +35,10 @@ export class DiscordInboundRouter {
     this.bindChannelSession = options.bindChannelSession || (async () => {});
     this.recordFrame = options.recordFrame || (async () => {});
     this.seenMessage = options.seenMessage || (async () => false);
+    // The edit path updates the frame a message already became, so the mapping row
+    // has to be readable and writable from here rather than from the caller.
+    this.findFrame = options.findFrame || (async () => null);
+    this.updateFrameAudit = options.updateFrameAudit || (async () => {});
     this.appendToSession = options.appendToSession;
     this.log = options.log || (() => {});
     this.botUserID = options.botUserID || (() => null);
@@ -48,9 +56,107 @@ export class DiscordInboundRouter {
       throw new Error('DiscordInboundRouter requires authorizeInbound; inbound without an authorization check is an injection path');
   }
 
+
+  // An edit never creates a frame and never rewrites the text the bot first read: it
+  // appends to that frame's content and keeps the original. Edits do not wake the
+  // session - the bot sees the change in its context when it next runs.
+  async handleEdit(data) {
+    if (!data || typeof data !== 'object') return { handled: false, reason: 'no_payload' };
+
+    let botID = this.botUserID();
+    let author = data.author || data.member?.user || data.user || null;
+    if (botID && author?.id === botID) return { handled: false, reason: 'own_message' };
+    if (author?.bot === true) return { handled: false, reason: 'bot_author' };
+
+    let messageID = data.id || data.message?.id || null;
+    let channelID = data.channel_id || data.channel?.id || null;
+    let newContent = data.content ?? data.message?.content ?? null;
+
+    // Discord posts MESSAGE_UPDATE for embed unfurls and link previews with no content
+    // field at all. Those carry nothing to record, and treating them as an error would
+    // log noise every time someone pastes a link.
+    if (newContent === null || newContent === undefined)
+      return { handled: false, reason: 'edit_without_content' };
+    if (!messageID || !channelID) return { handled: false, reason: 'no_ids' };
+
+    let row = await this.findFrame(messageID);
+    if (!row || !row.frame_id) {
+      // An edit for a message this transport never framed: nothing to update, and
+      // guessing which frame it meant would be worse than ignoring it.
+      return { handled: false, reason: 'unframed_message', channelID, messageID };
+    }
+
+    // An edit is a write. It is authorized against the same action and channel the
+    // original message was, because the mapping row only exists for a message that
+    // already passed the gate. Skipping it here is how the old inline HTTP copy let an
+    // edit land with no capability check at all.
+    let actorID = author?.id || null;
+    if (!actorID) return { handled: false, reason: 'no_author', channelID, messageID };
+
+    {
+      let verdict = await this.authorizeInbound({ actorID, authorName: author.username || 'discord', channelID });
+      if (!verdict || verdict.allowed !== true) {
+        this.log('warn',
+          'discord: denied edit from ' + (author.username || 'discord') + ' (' + actorID
+          + ') in channel ' + channelID + ': ' + (verdict?.reason || 'no verdict'));
+        return {
+          handled: false,
+          reason: 'not_authorized',
+          channelID,
+          actorID,
+          messageID,
+          detail: verdict?.reason || null,
+        };
+      }
+    }
+
+    let editedAt = data.edited_timestamp || new Date().toISOString();
+
+    // original_text is the prefixed text as framed, so the diff keeps the speaker
+    // attribution instead of comparing against raw Discord content.
+    let before = String(row.original_text).split(NEWLINE);
+    let after = String(newContent).split(NEWLINE);
+    let diff = [];
+    for (let i = 0; i < Math.max(before.length, after.length); i++) {
+      if ((before[i] ?? '') === (after[i] ?? '')) continue;
+      if (before[i] !== undefined) diff.push('- ' + before[i]);
+      if (after[i] !== undefined) diff.push('+ ' + after[i]);
+    }
+
+    let entry = { editedAt, diff: diff.join(NEWLINE) || '(no textual change)' };
+    let existingAudit = Array.isArray(row.audit) ? row.audit : [];
+    let audit = [...existingAudit, entry];
+
+    await this.appendToSession(row.session_id, {
+      id: row.frame_id,
+      text: row.original_text,
+      source: 'discord',
+      // The audit tail must ride inside content: buildUserMessageContent keeps extra
+      // fields from input.content, so a top-level audit was silently dropped.
+      content: { audit },
+    });
+
+    await this.updateFrameAudit({ messageID, audit, edits: (row.edits || 0) + 1 });
+
+    return {
+      handled: true,
+      edited: true,
+      sessionID: row.session_id,
+      frameID: row.frame_id,
+      messageID,
+      channelID,
+      edits: (row.edits || 0) + 1,
+    };
+  }
+
   // Route one dispatch event. Returns a result object describing what happened, which
   // is what the tests assert on — a boolean would lose the reason.
   async handle(eventType, data) {
+    // MESSAGE_UPDATE is a real event with a real handler. Until this branch existed the
+    // router answered 'not_a_message' for it, so over the gateway an edit was silently
+    // dropped, and the inline copy of edit handling in the HTTP path was not only a
+    // second implementation but never consulted the authorization gate.
+    if (eventType === 'MESSAGE_UPDATE') return this.handleEdit(data);
     if (eventType !== 'MESSAGE_CREATE') return { handled: false, reason: 'not_a_message' };
     if (!data || typeof data !== 'object') return { handled: false, reason: 'no_payload' };
 

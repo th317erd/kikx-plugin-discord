@@ -404,6 +404,15 @@ export function setup(provide) {
         [messageID],
       )),
       appendToSession: (sessionID, input) => appendToSession(sessionID, input),
+      // Both live in the mapping table this transport owns.
+      findFrame: (messageID) => db().one(
+        'SELECT session_id, frame_id, original_text, edits, audit FROM discord_message_frame WHERE message_id = $1',
+        [messageID],
+      ),
+      updateFrameAudit: ({ messageID, audit, edits }) => db().query(
+        'UPDATE discord_message_frame SET edits = $2, audit = $3::jsonb WHERE message_id = $1',
+        [messageID, edits, JSON.stringify(audit)],
+      ),
       log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
       botUserID: () => gateway?.status?.().userId || gateway?.userId || null,
       // Deny by default, from the same authority table the send path uses. A Discord
@@ -580,66 +589,32 @@ export function setup(provide) {
       // tail added to its content. It never creates a second frame and never rewrites the
       // text the bot first saw. Edits do not wake the session - a quiet append, because
       // the bot reads the change in its context when it next runs.
-      if (payload?.t === 'MESSAGE_UPDATE') {
-        let messageID = payload?.id || payload?.message?.id || null;
-        let newContent = payload?.content ?? payload?.message?.content ?? payload?.data?.content ?? null;
-        let editedAt = payload?.edited_timestamp || new Date().toISOString();
 
-        if (!messageID || newContent === null) {
-          response.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-          response.end(JSON.stringify({ error: { message: 'edit event without id or content' } }));
+      // Edits go through the same policy object that frames messages, so the
+      // authorization gate, the self-message filter and the audit format have exactly
+      // one definition. The inline copy that used to live here was a second
+      // implementation, and it never consulted the gate at all.
+      if (payload?.t === 'MESSAGE_UPDATE') {
+        let edited = await inbound.handle('MESSAGE_UPDATE', payload);
+        if (edited.handled) {
+          response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({ ok: true, updated: edited.frameID, edit: edited.edits }));
           return;
         }
-
-        let row = await db().one(
-          'SELECT session_id, frame_id, original_text, edits, audit FROM discord_message_frame WHERE message_id = $1',
-          [messageID],
-        );
-        let existingAudit = Array.isArray(row?.audit) ? row.audit : [];
-        if (!row || !row.frame_id) {
+        if (edited.reason === 'unframed_message') {
           // An edit for a message we never stored: nothing to update, and guessing would
           // be worse than ignoring it.
           response.writeHead(204);
           response.end();
           return;
         }
-
-        // original_text is the prefixed text as framed, so the update keeps the speaker
-        // attribution instead of replacing it with the raw Discord content.
-        let before = String(row.original_text).split('\n');
-        let after = String(newContent).split('\n');
-        let diff = [];
-        for (let i = 0; i < Math.max(before.length, after.length); i++) {
-          if ((before[i] ?? '') === (after[i] ?? '')) continue;
-          if (before[i] !== undefined) diff.push(`- ${before[i]}`);
-          if (after[i] !== undefined) diff.push(`+ ${after[i]}`);
+        if (edited.reason === 'not_authorized') {
+          response.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({ error: { message: 'Not authorized', reason: edited.detail } }));
+          return;
         }
-
-        let entry = {
-          editedAt,
-          diff: diff.join('\n') || '(no textual change)',
-        };
-
-        // Accumulate: the tail grows with every edit. There is no frame reader on the
-        // plugin context, so the transport keeps its own record in the mapping table -
-        // it owns that row and reading it back is unambiguous.
-
-        await appendToSessionQuietly(row.session_id, {
-          id: row.frame_id,
-          text: row.original_text,
-          source: 'discord',
-          // The audit tail must ride inside content: buildUserMessageContent only keeps
-          // extra fields from input.content, so a top-level audit was silently dropped.
-          content: { audit: [...existingAudit, entry] },
-        });
-
-        await db().query(
-          'UPDATE discord_message_frame SET edits = edits + 1, audit = $2::jsonb WHERE message_id = $1',
-          [messageID, JSON.stringify([...existingAudit, entry])],
-        );
-
         response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
-        response.end(JSON.stringify({ ok: true, updated: row.frame_id, edit: row.edits + 1 }));
+        response.end(JSON.stringify({ ok: true, note: 'not updated: ' + edited.reason }));
         return;
       }
 

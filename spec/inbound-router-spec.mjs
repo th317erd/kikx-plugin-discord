@@ -127,7 +127,9 @@ test('a message with empty content is reported as a missing MESSAGE_CONTENT inte
 test('non-message events and non-message types are not framed', async () => {
   let { router, calls } = makeRouter();
 
-  assert.equal((await router.handle('MESSAGE_UPDATE', message())).reason, 'not_a_message');
+  // MESSAGE_UPDATE is no longer lumped in with non-message events: it has a handler,
+  // and an edit for a message that was never framed reports that specifically.
+  assert.equal((await router.handle('MESSAGE_UPDATE', message())).reason, 'unframed_message');
   assert.equal((await router.handle('GUILD_CREATE', { id: 'g1' })).reason, 'not_a_message');
   // Type 7 is a guild member join; there is no text to frame.
   assert.equal((await router.handle('MESSAGE_CREATE', message({ type: 7 }))).reason, 'unsupported_type');
