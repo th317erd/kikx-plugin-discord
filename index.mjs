@@ -12,6 +12,8 @@
 // =============================================================================
 
 import crypto from 'node:crypto';
+import { DiscordGateway, DEFAULT_INTENTS } from './gateway.mjs';
+import { DiscordInboundRouter } from './inbound-router.mjs';
 
 export const pluginName = 'discord';
 
@@ -124,6 +126,12 @@ export function setup(provide) {
     let sequence = null;
     let stopped = false;
 
+    // The gateway is the only path by which an ordinary channel message reaches a
+    // session; interactions are slash commands and buttons only. Keeping this wiring in
+    // onInit is what makes gateway.mjs reachable from the plugin rather than a module
+    // only its own spec imports.
+    let gateway = null;
+
     async function gatewayLoop() {
       let token = await readConfig('/kikx/discord/bot/token', null);
       if (!token) {
@@ -132,9 +140,47 @@ export function setup(provide) {
         console.warn('[discord] gateway not started: no bot token configured');
         return;
       }
-      // Real implementation lives behind this. It must not be faked: a gateway that
-      // reports "connected" without a socket is worse than one that refuses.
-      console.warn('[discord] gateway implementation pending');
+
+      // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
+      // a database, or a session runtime. Every effect it needs is bound here.
+      let inbound = new DiscordInboundRouter({
+        findChannelSession: (channelID) => db().one(
+          'SELECT session_id FROM discord_channel_session WHERE channel_id = $1',
+          [channelID],
+        ),
+        bindChannelSession: ({ channelID, sessionID }) => db().query(
+          'INSERT INTO discord_channel_session (channel_id, session_id) VALUES ($1,$2) ON CONFLICT (channel_id) DO NOTHING',
+          [channelID, sessionID],
+        ),
+        recordFrame: ({ messageID, sessionID, frameID, text }) => db().query(
+          'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
+          [messageID, sessionID, frameID, text],
+        ),
+        // Dedupe against the mapping table the transport already owns: a RESUME replay
+        // redelivers events, and framing one twice would duplicate the message.
+        seenMessage: async (messageID) => Boolean(await db().one(
+          'SELECT 1 AS seen FROM discord_message_frame WHERE message_id = $1',
+          [messageID],
+        )),
+        appendToSession: (sessionID, input) => appendToSession(sessionID, input),
+        log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
+        botUserID: () => gateway?.status?.().userId || gateway?.userId || null,
+      });
+
+      gateway = new DiscordGateway({
+        token,
+        intents: DEFAULT_INTENTS,
+        onDispatch: async (eventType, data) => {
+          let result = await inbound.handle(eventType, data);
+          // Everything the router declines to frame is worth one line, except the
+          // high-frequency cases: silence there would hide a missing intent.
+          if (!result.handled && result.reason !== 'not_a_message' && result.reason !== 'own_message')
+            console.warn(`[discord] not framed: ${result.reason}${result.channelID ? ` (channel ${result.channelID})` : ''}`);
+        },
+        log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
+      });
+
+      await gateway.start();
     }
 
     mountHttp(async ({ request, response, rawBody, json, subPath }) => {
@@ -288,7 +334,7 @@ export function setup(provide) {
       }
       response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
       response.end(JSON.stringify({ ok: true, sessionID: binding.session_id }));
-    });
+    }, { auth: 'public' });
 
     // Returned as an object, not a function: loadPlugins treats a returned function as a
     // teardown and would silently skip onInit and onShutdown.
@@ -299,6 +345,10 @@ export function setup(provide) {
         if (heartbeat) clearInterval(heartbeat);
         if (socket && typeof socket.close === 'function') socket.close();
         socket = null;
+        // The gateway owns its own reconnect timers; leaving them armed would keep
+        // dialling Discord for a plugin that has been unloaded.
+        if (gateway) gateway.stop();
+        gateway = null;
       },
     };
   });
