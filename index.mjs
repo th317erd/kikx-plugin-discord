@@ -28,6 +28,10 @@ export function setup(provide) {
     // bytes, so without this comparison a captured request can be replayed indefinitely.
     const MAX_SIGNATURE_AGE_SECONDS = 300;
 
+    // The bot token lives under one config path; naming it once keeps the gateway, the
+    // send tool and the interaction follow-up from drifting to different keys.
+    const KIKX_DISCORD_BOT_TOKEN_PATH = '/kikx/discord/bot/token';
+
     // Ed25519 verification of X-Signature-Ed25519 over timestamp+body.
     function verifySignature({ publicKey, signature, timestamp, rawBody, now = Date.now() }) {
       if (!publicKey) return { ok: false, reason: 'no public key configured' };
@@ -52,6 +56,47 @@ export function setup(provide) {
         return { ok };
       } catch (error) {
         return { ok: false, reason: String(error.message) };
+      }
+    }
+
+    // Interaction callback types we answer. A slash command (2) and a component click (3)
+    // both expect a callback within three seconds; a guild message event, which is the
+    // shape the gateway delivers, does not.
+    const ACKABLE_INTERACTION_TYPES = new Set([ 2, 3 ]);
+
+    // Components defer differently (type 6) than commands (type 5), and Discord rejects
+    // the wrong one for the interaction kind.
+    function deferTypeFor(interactionType) {
+      return interactionType === 3 ? 6 : 5;
+    }
+
+    // The real answer goes to the interaction webhook, addressed by @original so it edits
+    // the deferred placeholder instead of posting a second message. This runs after the
+    // HTTP response has been sent, so a failure here has no status code left to occupy:
+    // it is logged, and the placeholder is what the user is left looking at.
+    async function updateInteractionOriginal({ applicationID, interactionToken, content }) {
+      let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
+      if (!token) return { ok: false, pending: 'no-bot-token' };
+
+      try {
+        let res = await fetch(
+          'https://discord.com/api/v10/webhooks/' + encodeURIComponent(applicationID)
+            + '/' + encodeURIComponent(interactionToken) + '/messages/@original',
+          {
+            method: 'PATCH',
+            headers: {
+              Authorization: 'Bot ' + token,
+              'Content-Type': 'application/json',
+              'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
+            },
+            body: JSON.stringify({ content: String(content).slice(0, 2000) }),
+          },
+        );
+        if (!res.ok)
+          return { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 300) };
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: String(error?.message || error) };
       }
     }
 
@@ -81,7 +126,7 @@ export function setup(provide) {
         if (!verdict.allowed)
           return { sent: false, denied: true, reason: verdict.reason };
 
-        let token = await readConfig('/kikx/discord/bot/token', null);
+        let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
         if (!token) {
           // Authorised but unable to deliver. Saying so is the only honest answer: a
           // "sent" that did not send is worse than a refusal.
@@ -338,7 +383,7 @@ export function setup(provide) {
     }
 
     async function gatewayLoop() {
-      let token = await readConfig('/kikx/discord/bot/token', null);
+      let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
       if (!token) {
         // No token: say so once and stop. Reconnect-spinning on a missing credential is
         // how a plugin becomes a log flood.
@@ -392,6 +437,65 @@ export function setup(provide) {
       if (payload && payload.type === 1) {
         response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ type: 1 }));
+        return;
+      }
+
+      // --- interaction callbacks -------------------------------------------------
+      // Discord parses this response body as an interaction callback; it does not care
+      // about the status code. Answering 202 with a Kikx-shaped body therefore looked
+      // successful here and to every test, while Discord told the user "The application
+      // did not respond": a slash command was being served a message-event contract.
+      // The callback is now the deferral Discord expects, and the outcome is delivered
+      // on the interaction webhook, because framing needs the database and cannot be
+      // guaranteed inside the three-second window.
+      if (payload && ACKABLE_INTERACTION_TYPES.has(payload.type)) {
+        let applicationID = payload.application_id || await readConfig('/kikx/discord/application/id', null);
+        let interactionToken = payload.token || null;
+
+        // Without credentials there is no webhook to correct a deferral on, so deferring
+        // would strand the user on a permanent "thinking...". An immediate ephemeral
+        // answer is in-window and true.
+        if (!applicationID || !interactionToken) {
+          response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({
+            type: 4,
+            data: {
+              content: 'Kikx has no Discord application credential configured, so this interaction was not processed.',
+              flags: 64,
+            },
+          }));
+          return;
+        }
+
+        // Acknowledge BEFORE any work: dedupe, authorization and the session write all
+        // happen below and any of them can outlast the window. Ephemeral keeps the
+        // channel quiet while the outcome is still unknown.
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ type: deferTypeFor(payload.type), data: { flags: 64 } }));
+
+        // The interaction id is unique per invocation, so it stands in for a message id
+        // and dedupe, recordFrame and the edit mapping keep working unchanged.
+        await refreshInboundConfig();
+        let routed = await inbound.handle('MESSAGE_CREATE', payload);
+
+        let reply;
+        if (routed.handled)
+          reply = 'Received - framed into session ' + routed.sessionID
+            + (routed.frameID ? ' (frame ' + routed.frameID + ')' : '') + '.';
+        else if (routed.reason === 'duplicate')
+          reply = 'Already received - this interaction was framed earlier.';
+        else if (routed.reason === 'not_authorized')
+          reply = 'Not authorized: your Discord account has no grant to send into this channel.';
+        else if (routed.reason === 'unbound_channel')
+          reply = 'This channel is not bound to a Kikx session, so nothing was framed.';
+        else
+          reply = 'Not framed: ' + routed.reason + '.';
+
+        let updated = await updateInteractionOriginal({ applicationID, interactionToken, content: reply });
+        if (!updated.ok)
+          console.warn('[discord] interaction follow-up failed'
+            + (updated.status ? ' (HTTP ' + updated.status + ')' : '')
+            + ': ' + (updated.error || updated.pending || 'unknown'));
         return;
       }
 

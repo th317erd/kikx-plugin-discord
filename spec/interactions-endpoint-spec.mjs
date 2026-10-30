@@ -31,7 +31,7 @@ class FakePluginInterface {}
 
 // Builds the plugin and returns a function that delivers one HTTP request to the
 // registered mount, exactly as the router would.
-function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), allowed } = {}) {
+function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), allowed, token = null, applicationID = null } = {}) {
   let captured = { frames: [], queries: [], authorizations: [] };
 
   let db = () => ({
@@ -72,7 +72,8 @@ function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), 
     },
     appendToSessionQuietly: async () => ({ frame: { id: 'frame-1' } }),
     readConfig: async (path) => {
-      if (path === '/kikx/discord/bot/token') return null;
+      if (path === '/kikx/discord/bot/token') return token;
+      if (path === '/kikx/discord/application/id') return applicationID;
       if (path === '/kikx/discord/public/key') return PUBLIC_KEY_HEX;
       return null;
     },
@@ -90,9 +91,15 @@ function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), 
 
     let status = null;
     let payload = null;
+    // The ordering test needs to know whether the response was already closed when the
+    // session write ran, so the harness records it rather than leaving it to inference.
+    captured.responseFinished = false;
     let response = {
       writeHead(code) { status = code; },
-      end(text) { if (text) payload = JSON.parse(text); },
+      end(text) {
+        captured.responseFinished = true;
+        if (text) payload = JSON.parse(text);
+      },
     };
     await captured.handler({
       request: { method: 'POST', headers, url: '/api/plugins/discord/interactions' },
@@ -203,15 +210,182 @@ test('an unbound channel answers 404, because it is an operator error and not a 
 
 // --- 4. Interaction envelopes carry their text somewhere else ---------------------
 
-test('a slash command option is framed as the message text', async () => {
-  let { captured, post } = buildPlugin();
-  let payload = {
-    id: 'i-1', type: 2, channel_id: 'chan-1',
+// --- 5. Interaction callbacks: the answer Discord actually reads -------------------
+//
+// This section replaces an earlier test that asserted 202 for a slash command. That
+// assertion was the bug written down: 202 with a Kikx-shaped body is not an interaction
+// callback, so Discord showed the user "The application did not respond" while the suite
+// stayed green. Every test below drives the real handler with a real signature.
+
+const BOT_TOKEN = 'test-bot-token';
+const APPLICATION_ID = 'app-123';
+
+function slashCommand(overrides = {}) {
+  return {
+    id: 'i-1', type: 2, channel_id: 'chan-1', application_id: APPLICATION_ID, token: 'itok-abc',
     data: { name: 'kikx', options: [{ name: 'message', value: 'from a slash command' }] },
     member: { user: { id: 'u1', username: 'wyatt' } },
+    ...overrides,
   };
-  let result = await post(JSON.stringify(payload));
-  assert.equal(result.status, 202);
-  assert.equal(captured.frames.length, 1);
+}
+
+// Captures the PATCH the plugin issues after it has already answered Discord. Returns a
+// restore function, because replacing global fetch is process-wide for the test file.
+function captureFetch({ status = 200, body = '{}' } = {}) {
+  let calls = [];
+  let original = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), options });
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async text() { return body; },
+      async json() { return JSON.parse(body); },
+    };
+  };
+  return { calls, restore() { globalThis.fetch = original; } };
+}
+
+test('a slash command is answered with a type 5 deferral, not a 202 and silence', async () => {
+  let { captured, post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch();
+  try {
+    let result = await post(JSON.stringify(slashCommand()));
+    assert.equal(result.status, 200, 'Discord reads the body, but 200 is the documented callback status');
+    assert.equal(result.body.type, 5, 'a deferred channel message is type 5');
+    assert.equal(result.body.data.flags, 64, 'the deferral is ephemeral so the channel stays quiet');
+  } finally {
+    fetchLog.restore();
+  }
+  assert.equal(captured.frames.length, 1, 'the ack must not replace framing the command');
   assert.match(captured.frames[0].input.text, /from a slash command/);
+});
+
+test('a component interaction defers with type 6, because type 5 is rejected for it', async () => {
+  let { post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch();
+  try {
+    let result = await post(JSON.stringify(slashCommand({ id: 'i-2', type: 3 })));
+    assert.equal(result.body.type, 6, 'component interactions defer as UPDATE_MESSAGE, not CHANNEL_MESSAGE');
+  } finally {
+    fetchLog.restore();
+  }
+});
+
+test('the outcome is delivered to the interaction webhook @original with the bot token', async () => {
+  let { post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch();
+  try {
+    await post(JSON.stringify(slashCommand()));
+    assert.equal(fetchLog.calls.length, 1, 'exactly one follow-up, not one per branch');
+    let { url, options } = fetchLog.calls[0];
+    assert.equal(
+      url,
+      'https://discord.com/api/v10/webhooks/app-123/itok-abc/messages/@original',
+      '@original edits the deferred placeholder; omitting it posts a second message',
+    );
+    assert.equal(options.method, 'PATCH');
+    assert.equal(options.headers.Authorization, 'Bot ' + BOT_TOKEN, 'the webhook needs the bot credential');
+    let body = JSON.parse(options.body);
+    assert.match(body.content, /framed into session session-1/);
+  } finally {
+    fetchLog.restore();
+  }
+});
+
+test('the ack is sent before the session write, so a slow database cannot miss the window', async () => {
+  // The handler must have called response.end() before it awaited the router. Ordering is
+  // observed directly: at the moment the router runs, the response must already be closed.
+  let { captured, post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch();
+  let answeredBeforeFraming = null;
+  let realAppend = captured.frames.push.bind(captured.frames);
+  captured.frames.push = (entry) => {
+    answeredBeforeFraming = captured.responseFinished;
+    return realAppend(entry);
+  };
+  try {
+    await post(JSON.stringify(slashCommand()));
+  } finally {
+    fetchLog.restore();
+  }
+  assert.equal(answeredBeforeFraming, true, 'the deferral must precede the database work');
+});
+
+test('without an application credential the reply is immediate and says so, rather than deferring forever', async () => {
+  // No deferral means no webhook to correct it on: a user would watch "thinking..." until
+  // the token expires. An ephemeral type 4 is the only answer that is both in-window and true.
+  let { captured, post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch();
+  try {
+    let result = await post(JSON.stringify(slashCommand({ application_id: undefined, token: undefined })));
+    assert.equal(result.status, 200);
+    assert.equal(result.body.type, 4);
+    assert.equal(result.body.data.flags, 64);
+    assert.match(result.body.data.content, /not processed/);
+  } finally {
+    fetchLog.restore();
+  }
+  assert.equal(fetchLog.calls.length, 0, 'nothing to patch, so nothing is fetched');
+  assert.equal(captured.frames.length, 0, 'and nothing is framed, because the command was not processed');
+});
+
+test('a denied sender is still acknowledged, and told why, instead of being ignored', async () => {
+  // The ack is a transport obligation and must not depend on policy. What policy changes
+  // is the follow-up text and whether a frame exists.
+  let { captured, post } = buildPlugin({ token: BOT_TOKEN, allowed: false });
+  let fetchLog = captureFetch();
+  try {
+    let result = await post(JSON.stringify(slashCommand({ id: 'i-3' })));
+    assert.equal(result.body.type, 5, 'a denied interaction is still a received interaction');
+    let body = JSON.parse(fetchLog.calls[0].options.body);
+    assert.match(body.content, /Not authorized/);
+  } finally {
+    fetchLog.restore();
+  }
+  assert.equal(captured.frames.length, 0, 'a denied sender must not write into the session');
+});
+
+test('a replayed interaction receives the same deferral and is framed only once', async () => {
+  let { captured, post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch();
+  try {
+    await post(JSON.stringify(slashCommand({ id: 'i-4' })));
+    let second = await post(JSON.stringify(slashCommand({ id: 'i-4' })));
+    assert.equal(second.body.type, 5, 'a duplicate is still acknowledgeable');
+    let body = JSON.parse(fetchLog.calls[1].options.body);
+    assert.match(body.content, /Already received/);
+  } finally {
+    fetchLog.restore();
+  }
+  assert.equal(captured.frames.length, 1, 'dedupe still applies to the interaction path');
+});
+
+test('an unbound channel explains the binding, which is an operator fix', async () => {
+  let { post } = buildPlugin({ token: BOT_TOKEN, binding: null });
+  let fetchLog = captureFetch();
+  try {
+    await post(JSON.stringify(slashCommand({ id: 'i-5' })));
+    let body = JSON.parse(fetchLog.calls[0].options.body);
+    assert.match(body.content, /not bound/);
+  } finally {
+    fetchLog.restore();
+  }
+});
+
+test('a failed follow-up is logged and swallowed, because Discord already has its answer', async () => {
+  let { post } = buildPlugin({ token: BOT_TOKEN });
+  let fetchLog = captureFetch({ status: 400, body: '{"message":"bad"}' });
+  let warnings = [];
+  let realWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    let result = await post(JSON.stringify(slashCommand({ id: 'i-6' })));
+    assert.equal(result.body.type, 5, 'a webhook failure must not change what Discord was told');
+  } finally {
+    console.warn = realWarn;
+    fetchLog.restore();
+  }
+  assert.equal(warnings.length, 1, 'silence would hide a broken follow-up');
+  assert.match(warnings[0], /HTTP 400/);
 });
