@@ -24,10 +24,22 @@ export function setup(provide) {
     if (!PluginInterface)
       throw new Error('kikx-plugin-discord requires PluginInterface in plugin context');
 
+    // Discord's documented replay window. A signature is valid forever over the same
+    // bytes, so without this comparison a captured request can be replayed indefinitely.
+    const MAX_SIGNATURE_AGE_SECONDS = 300;
+
     // Ed25519 verification of X-Signature-Ed25519 over timestamp+body.
-    function verifySignature({ publicKey, signature, timestamp, rawBody }) {
+    function verifySignature({ publicKey, signature, timestamp, rawBody, now = Date.now() }) {
       if (!publicKey) return { ok: false, reason: 'no public key configured' };
       if (!signature || !timestamp) return { ok: false, reason: 'missing signature headers' };
+
+      // The timestamp is part of the signed material, so a stale one cannot be
+      // rewritten by an attacker - but it is only binding if we compare it to now.
+      let sentAt = Number(timestamp);
+      if (!Number.isFinite(sentAt)) return { ok: false, reason: 'unreadable signature timestamp' };
+      let ageSeconds = Math.abs(now / 1000 - sentAt);
+      if (ageSeconds > MAX_SIGNATURE_AGE_SECONDS)
+        return { ok: false, reason: `signature timestamp is ${Math.round(ageSeconds)}s old, outside the ${MAX_SIGNATURE_AGE_SECONDS}s window` };
       try {
         // Discord supplies the raw 32-byte Ed25519 key. Node needs a complete SPKI
         // structure, so the key is wrapped in the fixed Ed25519 SPKI prefix first.
@@ -132,6 +144,32 @@ export function setup(provide) {
     // only its own spec imports.
     let gateway = null;
 
+    // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
+    // a database, or a session runtime. Every effect it needs is bound here.
+    let inbound = new DiscordInboundRouter({
+      findChannelSession: (channelID) => db().one(
+        'SELECT session_id FROM discord_channel_session WHERE channel_id = $1',
+        [channelID],
+      ),
+      bindChannelSession: ({ channelID, sessionID }) => db().query(
+        'INSERT INTO discord_channel_session (channel_id, session_id) VALUES ($1,$2) ON CONFLICT (channel_id) DO NOTHING',
+        [channelID, sessionID],
+      ),
+      recordFrame: ({ messageID, sessionID, frameID, text }) => db().query(
+        'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
+        [messageID, sessionID, frameID, text],
+      ),
+      // Dedupe against the mapping table the transport already owns: a RESUME replay
+      // redelivers events, and framing one twice would duplicate the message.
+      seenMessage: async (messageID) => Boolean(await db().one(
+        'SELECT 1 AS seen FROM discord_message_frame WHERE message_id = $1',
+        [messageID],
+      )),
+      appendToSession: (sessionID, input) => appendToSession(sessionID, input),
+      log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
+      botUserID: () => gateway?.status?.().userId || gateway?.userId || null,
+    });
+
     async function gatewayLoop() {
       let token = await readConfig('/kikx/discord/bot/token', null);
       if (!token) {
@@ -140,32 +178,6 @@ export function setup(provide) {
         console.warn('[discord] gateway not started: no bot token configured');
         return;
       }
-
-      // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
-      // a database, or a session runtime. Every effect it needs is bound here.
-      let inbound = new DiscordInboundRouter({
-        findChannelSession: (channelID) => db().one(
-          'SELECT session_id FROM discord_channel_session WHERE channel_id = $1',
-          [channelID],
-        ),
-        bindChannelSession: ({ channelID, sessionID }) => db().query(
-          'INSERT INTO discord_channel_session (channel_id, session_id) VALUES ($1,$2) ON CONFLICT (channel_id) DO NOTHING',
-          [channelID, sessionID],
-        ),
-        recordFrame: ({ messageID, sessionID, frameID, text }) => db().query(
-          'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
-          [messageID, sessionID, frameID, text],
-        ),
-        // Dedupe against the mapping table the transport already owns: a RESUME replay
-        // redelivers events, and framing one twice would duplicate the message.
-        seenMessage: async (messageID) => Boolean(await db().one(
-          'SELECT 1 AS seen FROM discord_message_frame WHERE message_id = $1',
-          [messageID],
-        )),
-        appendToSession: (sessionID, input) => appendToSession(sessionID, input),
-        log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
-        botUserID: () => gateway?.status?.().userId || gateway?.userId || null,
-      });
 
       gateway = new DiscordGateway({
         token,
@@ -221,7 +233,7 @@ export function setup(provide) {
       // the bot reads the change in its context when it next runs.
       if (payload?.t === 'MESSAGE_UPDATE') {
         let messageID = payload?.id || payload?.message?.id || null;
-        let newContent = payload?.content ?? payload?.message?.content ?? null;
+        let newContent = payload?.content ?? payload?.message?.content ?? payload?.data?.content ?? null;
         let editedAt = payload?.edited_timestamp || new Date().toISOString();
 
         if (!messageID || newContent === null) {
@@ -282,58 +294,35 @@ export function setup(provide) {
         return;
       }
 
-      // Real time, no debounce: the message goes straight into the session the channel
-      // is bound to. Kikx is a chat, so there is nothing to debounce - Discord's event
-      // is already the message.
+      // Ordinary messages and slash commands go through the SAME policy object the
+      // gateway uses above. An inline second copy here is how dedupe, the self-message
+      // filter, and the missing-intent diagnostic silently stopped applying to anything
+      // that arrived over HTTP - the two paths had already drifted apart.
       let channelId = payload?.channel_id || payload?.channel?.id || null;
-      let content = payload?.data?.options?.find?.((o) => o.name === 'message')?.value
-        || payload?.data?.content || payload?.content || null;
-      let authorName = payload?.member?.user?.username || payload?.author?.username || 'discord';
-
       if (!channelId) {
         response.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ error: { message: 'no channel_id in payload' } }));
         return;
       }
 
-      let binding = await db().one(
-        'SELECT session_id FROM discord_channel_session WHERE channel_id = $1',
-        [channelId],
-      );
-      if (!binding) {
+      let routed = await inbound.handle('MESSAGE_CREATE', payload);
+      if (routed.handled) {
+        response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ ok: true, sessionID: routed.sessionID, frameID: routed.frameID }));
+        return;
+      }
+
+      // An unbound channel is an operator error the caller can act on; a duplicate or a
+      // message with no text is not, and answering "not bound" for those would send
+      // whoever reads it chasing a binding that is already correct.
+      if (routed.reason === 'unbound_channel') {
         response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ error: { message: `channel ${channelId} is not bound to a session` } }));
         return;
       }
 
-      if (!content) {
-        response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
-        response.end(JSON.stringify({ ok: true, note: 'no message content to append' }));
-        return;
-      }
-
-      let messageID = payload?.id || payload?.message?.id || null;
-      let frame = await appendToSession(binding.session_id, {
-        text: `[discord:${authorName}] ${content}`,
-        source: 'discord',
-        channelID: channelId,
-        discordMessageID: messageID,
-      });
-
-      // Remember which frame this message became, so an edit can find it later. Written
-      // after the frame exists; an edit for a message with no row is ignored rather than
-      // guessed at.
-      // appendToSession returns { session, frame, commit, wakePending } - the frame id is
-      // one level down, and reading it as frame.id silently produced no mapping at all.
-      let frameID = frame?.frame?.id || frame?.id || null;
-      if (messageID && frameID) {
-        await db().query(
-          'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
-          [messageID, binding.session_id, frameID, `[discord:${authorName}] ${content}`],
-        );
-      }
       response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });
-      response.end(JSON.stringify({ ok: true, sessionID: binding.session_id }));
+      response.end(JSON.stringify({ ok: true, note: `not framed: ${routed.reason}` }));
     }, { auth: 'public' });
 
     // Returned as an object, not a function: loadPlugins treats a returned function as a

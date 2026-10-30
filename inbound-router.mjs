@@ -57,18 +57,35 @@ export class DiscordInboundRouter {
     if (data.author && data.author.bot === true)
       return { handled: false, reason: 'bot_author' };
 
-    if (!FRAMEABLE_MESSAGE_TYPES.has(data.type ?? 0))
+    // The type gate is about Discord guild message types. An interaction envelope has its
+    // own type namespace (1 = PING, 2 = APPLICATION_COMMAND), so applying the message set
+    // to it would reject every slash command as an unsupported message.
+    let isInteraction = Boolean(data.data || data.member || data.user);
+    if (!isInteraction && !FRAMEABLE_MESSAGE_TYPES.has(data.type ?? 0))
       return { handled: false, reason: 'unsupported_type' };
 
     // MESSAGE_CONTENT is privileged. When it is off, Discord sends the message anyway
     // with empty content — so this is the only signal that the intent is missing, and
     // it must be reported rather than dropped silently.
-    let content = typeof data.content === 'string' ? data.content.trim() : '';
+    let content = (typeof data.content === 'string' ? data.content : '')
+      || (typeof data.data?.content === 'string' ? data.data.content : '')
+      || String(data.data?.options?.find?.((o) => o.name === 'message')?.value ?? '');
+    content = content.trim();
     if (!content) return { handled: false, reason: 'empty_content_missing_intent' };
 
     let messageID = data.id;
-    let channelID = data.channel_id;
+    let channelID = data.channel_id || data.channel?.id || null;
     if (!messageID || !channelID) return { handled: false, reason: 'no_ids' };
+
+    // An interaction carries the speaker and the text in different places than a gateway
+    // message: the invoking user is under member/user, and the text is a command option
+    // or data.content. Without this the HTTP path cannot reuse the policy below.
+    let author = data.author || data.member?.user || data.user || null;
+    let authorID = author?.id || null;
+    let authorName = author?.username || data.author?.username || 'discord';
+    if (!authorID) return { handled: false, reason: 'no_author' };
+    if (botID && authorID === botID) return { handled: false, reason: 'own_message' };
+    if (author?.bot === true) return { handled: false, reason: 'bot_author' };
 
     if (await this.seenMessage(messageID))
       return { handled: false, reason: 'duplicate' };
@@ -83,7 +100,6 @@ export class DiscordInboundRouter {
       return { handled: false, reason: 'unbound_channel', channelID };
 
     let sessionID = binding.session_id;
-    let authorName = data.author?.username || data.member?.user?.username || 'discord';
     let text = `[discord:${authorName}] ${content}`;
 
     let frame = await this.appendToSession(sessionID, {
