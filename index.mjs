@@ -337,6 +337,51 @@ export function setup(provide) {
     // only its own spec imports.
     let gateway = null;
 
+    // The gateway reports through console.warn and nothing else can see it, so
+    // "is the bot connected, and why did my message not appear?" was answerable only
+    // from a shell on the host. These are the facts that answer it, exposed at
+    // GET /api/plugins/discord/status. No credential is ever included: a token in a
+    // status body is a token in a log.
+    let observed = {
+      startedAt: Date.now(),
+      tokenPresent: false,
+      lastDispatchAt: null,
+      lastDispatchType: null,
+      recentOutcomes: [],
+    };
+
+    // Every dispatch decision is recorded, not just the handled ones. A denial that is
+    // only a log line is indistinguishable from a gateway that never delivered anything.
+    function noteOutcome(eventType, result) {
+      observed.lastDispatchAt = Date.now();
+      observed.lastDispatchType = eventType;
+      observed.recentOutcomes.push({
+        at: new Date().toISOString(),
+        eventType,
+        handled: result?.handled === true,
+        reason: result?.reason || null,
+        channelID: result?.channelID || null,
+        actorID: result?.actorID || null,
+        detail: result?.detail || null,
+      });
+      if (observed.recentOutcomes.length > 20) observed.recentOutcomes.shift();
+    }
+
+    function gatewaySnapshot() {
+      let status = typeof gateway?.status === 'function' ? gateway.status() : null;
+      return {
+        tokenPresent: observed.tokenPresent,
+        connected: status?.ready === true,
+        gateway: status,
+        startedAt: new Date(observed.startedAt).toISOString(),
+        lastDispatchAt: observed.lastDispatchAt ? new Date(observed.lastDispatchAt).toISOString() : null,
+        lastDispatchType: observed.lastDispatchType,
+        recentOutcomes: observed.recentOutcomes.slice(-10),
+        inboundChannelID: inbound.autoBindChannelID,
+        inboundSessionID: inbound.autoBindSessionID,
+      };
+    }
+
     // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
     // a database, or a session runtime. Every effect it needs is bound here.
     let inbound = new DiscordInboundRouter({
@@ -387,17 +432,20 @@ export function setup(provide) {
       if (!token) {
         // No token: say so once and stop. Reconnect-spinning on a missing credential is
         // how a plugin becomes a log flood.
+        observed.tokenPresent = false;
         console.warn('[discord] gateway not started: no bot token configured');
         return;
       }
 
       await refreshInboundConfig();
+      observed.tokenPresent = true;
 
       gateway = new DiscordGateway({
         token,
         intents: DEFAULT_INTENTS,
         onDispatch: async (eventType, data) => {
           let result = await inbound.handle(eventType, data);
+          noteOutcome(eventType, result);
           // Everything the router declines to frame is worth one line, except the
           // high-frequency cases: silence there would hide a missing intent.
           if (!result.handled && result.reason !== 'not_a_message' && result.reason !== 'own_message')
@@ -409,7 +457,35 @@ export function setup(provide) {
       await gateway.start();
     }
 
-    mountHttp(async ({ request, response, rawBody, json, subPath }) => {
+    mountHttp(async ({ request, response, rawBody, json, subPath, context, identity }) => {
+      // --- status --------------------------------------------------------------
+      // The mount is public because Discord cannot hold a Kikx session; that must not
+      // make the status readable anonymously, so identity is resolved here. Core only
+      // resolves identity for non-public mounts, which is why this asks the account
+      // store directly rather than assuming identity arrived.
+      if (request.method === 'GET' && subPath === '/status') {
+        let viewer = identity;
+        if (!viewer) {
+          let accountStore = context?.has?.('accountStore')
+            ? context.require('accountStore')
+            : context?.accountStore || null;
+          if (accountStore && typeof accountStore.resolveIdentity === 'function') {
+            try { viewer = await accountStore.resolveIdentity(request); }
+            catch (_e) { viewer = null; }
+          }
+        }
+
+        if (!viewer) {
+          response.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({ error: { message: 'Sign in required to read Discord plugin status' } }));
+          return;
+        }
+
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({ ok: true, ...gatewaySnapshot() }));
+        return;
+      }
+
       if (request.method !== 'POST' || subPath !== '/interactions') {
         response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ error: { message: 'not found' } }));
