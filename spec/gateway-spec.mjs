@@ -117,6 +117,21 @@ test('a bad token fails the REST call and reports the HTTP status instead of pre
   let errorLog = logs.find((l) => l.level === 'error');
   assert.ok(errorLog, 'a rejected token must be logged as an error');
   assert.match(errorLog.message, /401/);
+  // A 401 cannot heal by waiting: the token is wrong until someone changes it. Retrying
+  // it is the reconnect storm that produced five redials in eleven seconds on the dev
+  // server, so this must stop and say why.
+  assert.equal(timers.pending().length, 0, 'a rejected token must not schedule a retry');
+  assert.equal(gateway.status().fatal?.code, 401, 'the rejection must be recorded for an operator');
+});
+
+test('a genuinely transient REST failure still retries', async () => {
+  let { gateway, timers } = makeGateway({
+    // 502 from the REST endpoint is a Discord-side outage: retrying is correct.
+    fetchImpl: async () => ({ ok: false, status: 502, text: async () => 'bad gateway' }),
+  });
+  await gateway.start();
+  assert.equal(gateway.socket, null);
+  assert.equal(gateway.status().fatal, null, 'a 502 is not a configuration fault');
   assert.equal(timers.pending().length, 1, 'a transient REST failure still schedules a retry');
 });
 
@@ -302,4 +317,47 @@ test('construction refuses without a token or without a WebSocket implementation
   } finally {
     globalThis.WebSocket = original;
   }
+});
+
+test('a fatal close code stops the reconnect loop instead of hammering Discord', async () => {
+  let { gateway, timers, logs } = makeGateway();
+  let socket = await establish(gateway);
+
+  // 4004 is "authentication failed": the token is wrong and will stay wrong, so
+  // every subsequent attempt is guaranteed to fail the same way.
+  socket.fire('close', { code: 4004, reason: 'Authentication failed.' });
+
+  assert.equal(
+    timers.pending().length,
+    0,
+    'a fatal close must not schedule another attempt',
+  );
+  assert.equal(gateway.status().ready, false);
+  assert.equal(gateway.status().fatal?.code, 4004, 'the fatal code must be recorded for an operator');
+  assert.ok(
+    logs.some((l) => l.level === 'error' && /4004/.test(l.message) && /authentication|fatal/i.test(l.message)),
+    `expected an operator-visible fatal log, saw ${JSON.stringify(logs.map((l) => l.message))}`,
+  );
+
+  // An operator restart after fixing the token must still work.
+  gateway.fatal = null;
+  await gateway.start();
+  assert.equal(timers.pending().length, 0, 'a fresh start must connect rather than merely retry');
+});
+
+test('a transient close code still reconnects, because that failure can heal', async () => {
+  let { gateway, timers } = makeGateway();
+  let socket = await establish(gateway);
+
+  // 1006 is an abnormal closure: network blip, Discord-side drop. Retrying is correct.
+  socket.fire('close', { code: 1006 });
+  assert.equal(timers.pending().length, 1, 'a transient close must schedule a retry');
+  assert.equal(gateway.status().fatal ?? null, null);
+
+  // As is 4013/4014? No: those are fatal (invalid intents / disallowed intents).
+  let second = makeGateway();
+  let sock2 = await establish(second.gateway);
+  sock2.fire('close', { code: 4013 });
+  assert.equal(second.timers.pending().length, 0, '4013 (invalid intents) is a config error, not a blip');
+  assert.equal(second.gateway.status().fatal?.code, 4013);
 });

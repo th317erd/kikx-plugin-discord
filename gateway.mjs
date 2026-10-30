@@ -54,6 +54,19 @@ export const DEFAULT_INTENTS =
 
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
+// Close codes that describe a configuration fault rather than a transient failure.
+// Retrying them cannot help: the token, the intents or the shard list will be exactly
+// as wrong on the next attempt, so a retry loop just turns one mistake into a
+// reconnect storm against Discord. Each entry is the operator-facing reason.
+export const FATAL_CLOSE_CODES = new Map([
+  [4004, 'authentication failed: the bot token is wrong or was reset'],
+  [4010, 'invalid shard'],
+  [4011, 'sharding required: this bot is in too many guilds for one connection'],
+  [4012, 'invalid API version'],
+  [4013, 'invalid intents: the requested intent bits are not a valid combination'],
+  [4014, 'disallowed intents: enable the privileged intents in the developer portal first'],
+]);
+
 // A tiny indirection over setTimeout so tests advance time instead of sleeping.
 function defaultSetTimeout(fn, ms) {
   let handle = setTimeout(fn, ms);
@@ -109,6 +122,9 @@ export class DiscordGateway {
     this.attempt = 0;
     this.stopped = false;
     this.ready = false;
+    // Non-null once a fatal close code has been seen. It latches so a later transient
+    // failure cannot quietly resume a loop that is known to be pointless.
+    this.fatal = null;
   }
 
   // Resolve the gateway endpoint through REST first. Discord hands out a per-session
@@ -124,7 +140,12 @@ export class DiscordGateway {
       // the wrong place.
       let detail = '';
       try { detail = (await res.text()).slice(0, 200); } catch (_e) { detail = ''; }
-      throw new Error(`gateway url request failed: HTTP ${res.status}${detail ? ` — ${detail}` : ''}`);
+      let error = new Error(`gateway url request failed: HTTP ${res.status}${detail ? ` — ${detail}` : ''}`);
+      // 401/403 is the REST face of close code 4004: the credentials are wrong.
+      if (res.status === 401 || res.status === 403) {
+        error.fatal = { code: res.status, reason: res.status === 401 ? 'authentication failed: the bot token is wrong or was reset' : 'forbidden: the bot lacks access' };
+      }
+      throw error;
     }
     let body = await res.json();
     if (!body || typeof body.url !== 'string')
@@ -134,16 +155,21 @@ export class DiscordGateway {
 
   async start() {
     this.stopped = false;
+    // A deliberate start is the operator's retry: after fixing a token or an intent,
+    // calling start() again must actually try rather than inherit the old verdict.
+    this.fatal = null;
     let url;
     try {
       url = this.resumeURL && this.sessionID
         ? `${this.resumeURL}/?v=10&encoding=json`
         : await this.resolveGatewayURL();
     } catch (error) {
-      // A bad token will not fix itself by reconnecting faster, but a transient REST
-      // failure will, so this still schedules a retry — with backoff.
+      // Rejections are separated here: a bad token or a forbidden bot is a configuration
+      // fault that a retry cannot fix, while a 5xx or a network error is an outage that
+      // can heal, so only the second kind is worth another attempt.
       this.log('error', `gateway start refused: ${error.message}`);
-      this.scheduleReconnect();
+      if (error.fatal) this.markFatal(error.fatal.code, error.fatal.reason);
+      else this.scheduleReconnect();
       return;
     }
     this.connect(url);
@@ -170,7 +196,13 @@ export class DiscordGateway {
       this.clearHeartbeat();
       this.socket = null;
       if (this.stopped) return;
-      this.log('warn', `gateway socket closed (code ${event?.code ?? 'unknown'})`);
+      let code = event?.code;
+      let fatalReason = FATAL_CLOSE_CODES.get(code);
+      if (fatalReason) {
+        this.markFatal(code, fatalReason);
+        return;
+      }
+      this.log('warn', `gateway socket closed (code ${code ?? 'unknown'})`);
       this.scheduleReconnect();
     });
     // A socket error is always followed by a close, so reconnect is handled there. The
@@ -316,8 +348,20 @@ export class DiscordGateway {
     }
   }
 
+  // Record a fault that retrying cannot fix, cancel anything pending, and say so loudly
+  // once. Silence here is the dangerous outcome: a dead gateway that looks idle.
+  markFatal(code, reason) {
+    this.fatal = { code, reason };
+    this.clearReconnect();
+    this.clearHeartbeat();
+    this.ready = false;
+    this.log('error', `gateway fatal close ${code}: ${reason} — not reconnecting; fix the configuration and restart the plugin`);
+  }
+
   scheduleReconnect() {
     if (this.stopped) return;
+    // A known configuration fault is not worth another attempt, no matter who asks.
+    if (this.fatal) return;
     this.clearReconnect();
     // Exponential backoff with jitter, capped. Without a cap a long outage turns into
     // hour-long gaps; without jitter, every reconnect lands on the same millisecond.
@@ -377,6 +421,7 @@ export class DiscordGateway {
       sessionID: this.sessionID,
       sequence: this.sequence,
       attempt: this.attempt,
+      fatal: this.fatal,
       heartbeatIntervalMS: this.heartbeatIntervalMS,
       userId: this.userId,
     };
