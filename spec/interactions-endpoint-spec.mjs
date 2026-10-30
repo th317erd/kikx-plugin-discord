@@ -31,8 +31,8 @@ class FakePluginInterface {}
 
 // Builds the plugin and returns a function that delivers one HTTP request to the
 // registered mount, exactly as the router would.
-function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set() } = {}) {
-  let captured = { frames: [], queries: [] };
+function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), allowed } = {}) {
+  let captured = { frames: [], queries: [], authorizations: [] };
 
   let db = () => ({
     async one(sql, params) {
@@ -57,7 +57,14 @@ function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set() }
       captured.options = options;
       return '/api/plugins/discord/';
     },
-    authorize: async () => ({ allowed: false }),
+    // Inbound over HTTP goes through the same gate as the gateway. Allowing here is the
+    // normal case; the denied case has its own test below.
+    authorize: async (request) => {
+      captured.authorizations.push(request);
+      return allowed === false
+        ? { allowed: false, reason: 'no grant for discord.inbound' }
+        : { allowed: true };
+    },
     db,
     appendToSession: async (sessionID, input) => {
       captured.frames.push({ sessionID, input });

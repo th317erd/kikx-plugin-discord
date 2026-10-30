@@ -129,6 +129,73 @@ export function setup(provide) {
 
     registry.registerTool('discord:send', SendTool);
 
+    // The inbound gate needs a table that did not previously exist, and a way to put a
+    // row in it. Without this tool the strict gate would be strict and unusable: every
+    // message would be denied and the only fix would be hand-written SQL.
+    //
+    // Deliberately narrow: it may only grant actions that belong to this plugin, and only
+    // to actors in the discord: namespace. A general capability-granting tool living
+    // inside a transport plugin would be a backdoor, so this one cannot grant authority
+    // it could not itself use.
+    const GRANTABLE_ACTIONS = new Set(['discord.inbound', 'discord.send']);
+
+    class PolicyGrantTool extends PluginInterface {
+      static pluginID = 'discord';
+      static featureName = 'policy_grant';
+      static displayName = 'Discord capability grant';
+      static description = 'Grant a Discord user the right to feed a channel into a session, or to send from it.';
+      // high means the platform asks a human before the call runs. Granting authority is
+      // exactly the class of action that should require that.
+      static riskLevel = 'high';
+      static inputSchema = {
+        type: 'object',
+        required: ['actor', 'action'],
+        properties: {
+          actor: { type: 'string', description: 'Discord user, as discord:<snowflake>' },
+          action: { type: 'string', enum: [...GRANTABLE_ACTIONS] },
+          channel: { type: 'string', description: 'Narrow the grant to one channel id' },
+          grantedBy: { type: 'string', description: 'Who is granting' },
+        },
+      };
+
+      async _execute(params = {}) {
+        let actor = String(params.actor || '').trim();
+        let action = String(params.action || '').trim();
+
+        if (!/^discord:\d+$/.test(actor)) {
+          return {
+            granted: false,
+            reason: 'actor must look like discord:<numeric user id>; this tool cannot grant '
+              + 'authority to anything outside the Discord namespace',
+          };
+        }
+        if (!GRANTABLE_ACTIONS.has(action)) {
+          return { granted: false, reason: 'action "' + action + '" is not granted by this plugin' };
+        }
+
+        let scope = params.channel ? { channel: String(params.channel) } : null;
+        await db().query(
+          `INSERT INTO discord_capability (actor, action, scope_json, granted_by) VALUES ($1, $2, $3::jsonb, $4) ON CONFLICT (actor, action, COALESCE(scope_json::text, '')) DO UPDATE SET granted_at = now(), granted_by = EXCLUDED.granted_by`,
+          [actor, action, scope === null ? null : JSON.stringify(scope), params.grantedBy || null],
+        );
+
+        // A grant that is written but not in effect is the silent-success shape this
+        // codebase keeps producing, so it is read back through the same authorize() the
+        // gate uses, and the result is reported rather than assumed.
+        let check = await authorize({ actor, action, scope: scope || {} });
+        return {
+          granted: check.allowed === true,
+          verified: check.allowed === true,
+          actor,
+          action,
+          scope,
+          reason: check.allowed ? null : check.reason,
+        };
+      }
+    }
+
+    registry.registerTool('discord:policy_grant', PolicyGrantTool);
+
     // --- gateway -------------------------------------------------------------
     // Interactions arrive over HTTP, but ordinary channel messages only arrive over the
     // gateway websocket. Without it, a Discord channel is a one-way transport: replies
@@ -168,7 +235,26 @@ export function setup(provide) {
       appendToSession: (sessionID, input) => appendToSession(sessionID, input),
       log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
       botUserID: () => gateway?.status?.().userId || gateway?.userId || null,
+      // Deny by default, from the same authority table the send path uses. A Discord
+      // user is a distinct actor from any Kikx user, so it is namespaced rather than
+      // mapped onto one: no Discord id can ever collide with a Kikx user id.
+      authorizeInbound: async ({ actorID, channelID }) => {
+        if (!actorID) return { allowed: false, reason: 'no actor id' };
+        return authorize({
+          actor: 'discord:' + actorID,
+          action: 'discord.inbound',
+          scope: { channel: channelID },
+        });
+      },
     });
+
+    // Binding config is read at delivery time rather than setup time: a reload has no
+    // config store yet, and an operator changing the target channel should not have to
+    // wait for a process restart to be believed.
+    async function refreshInboundConfig() {
+      inbound.autoBindChannelID = await readConfig('/kikx/discord/inbound/channel', null);
+      inbound.autoBindSessionID = await readConfig('/kikx/discord/inbound/session', null);
+    }
 
     async function gatewayLoop() {
       let token = await readConfig('/kikx/discord/bot/token', null);
@@ -178,6 +264,8 @@ export function setup(provide) {
         console.warn('[discord] gateway not started: no bot token configured');
         return;
       }
+
+      await refreshInboundConfig();
 
       gateway = new DiscordGateway({
         token,
@@ -305,6 +393,7 @@ export function setup(provide) {
         return;
       }
 
+      await refreshInboundConfig();
       let routed = await inbound.handle('MESSAGE_CREATE', payload);
       if (routed.handled) {
         response.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8' });

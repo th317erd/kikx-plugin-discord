@@ -34,6 +34,9 @@ export class DiscordInboundRouter {
     this.appendToSession = options.appendToSession;
     this.log = options.log || (() => {});
     this.botUserID = options.botUserID || (() => null);
+    // Required, not optional. A router that silently skips authorization when none is
+    // supplied is an injection path that passes every test that does not look for it.
+    this.authorizeInbound = options.authorizeInbound;
     this.autoBindChannelID = options.autoBindChannelID || null;
     this.autoBindSessionID = options.autoBindSessionID || null;
 
@@ -41,6 +44,8 @@ export class DiscordInboundRouter {
       throw new Error('DiscordInboundRouter requires appendToSession');
     if (typeof this.findChannelSession !== 'function')
       throw new Error('DiscordInboundRouter requires findChannelSession');
+    if (typeof this.authorizeInbound !== 'function')
+      throw new Error('DiscordInboundRouter requires authorizeInbound; inbound without an authorization check is an injection path');
   }
 
   // Route one dispatch event. Returns a result object describing what happened, which
@@ -89,6 +94,29 @@ export class DiscordInboundRouter {
 
     if (await this.seenMessage(messageID))
       return { handled: false, reason: 'duplicate' };
+
+    // -----------------------------------------------------------------------
+    // Inbound is not trusted merely because it arrived over TLS from Discord.
+    // Anyone who can type in a subscribed channel would otherwise write straight
+    // into a Kikx session, which is a prompt-injection path wearing a feature's
+    // clothes. The gate runs BEFORE the binding lookup and before any write, so a
+    // denied sender cannot claim a channel by speaking in it first.
+    // -----------------------------------------------------------------------
+    {
+      let verdict = await this.authorizeInbound({ actorID: authorID, authorName, channelID });
+      if (!verdict || verdict.allowed !== true) {
+        this.log('warn',
+          'discord: denied inbound from ' + authorName + ' (' + authorID
+          + ') in channel ' + channelID + ': ' + (verdict?.reason || 'no verdict'));
+        return {
+          handled: false,
+          reason: 'not_authorized',
+          channelID,
+          actorID: authorID,
+          detail: verdict?.reason || null,
+        };
+      }
+    }
 
     let binding = await this.findChannelSession(channelID);
     if (!binding && this.autoBindChannelID && this.autoBindSessionID && channelID === this.autoBindChannelID) {

@@ -17,6 +17,7 @@ function makeRouter(overrides = {}) {
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
     },
     botUserID: () => 'bot-1',
+    authorizeInbound: async () => ({ allowed: true }),
     ...overrides,
   });
   return { router, calls };
