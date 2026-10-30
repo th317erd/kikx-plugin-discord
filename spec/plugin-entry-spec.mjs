@@ -117,7 +117,9 @@ test('the plugin still registers its tool and migrations', () => {
   let { captured } = buildPlugin();
   // policy_grant is not decoration: the inbound gate is deny-by-default, and without a
   // way to write a grant the strict gate could only be satisfied by hand-written SQL.
-  assert.deepEqual(captured.tools, ['discord:send', 'discord:policy_grant']);
+  // policy_revoke is the mirror: without it a grant could only be taken away by
+  // someone with database access, which is not a security posture, it is a workaround.
+  assert.deepEqual(captured.tools, ['discord:send', 'discord:policy_grant', 'discord:policy_revoke']);
   assert.equal(captured.migrations.length, 1);
 });
 

@@ -196,6 +196,87 @@ export function setup(provide) {
 
     registry.registerTool('discord:policy_grant', PolicyGrantTool);
 
+    // The grant tool without its mirror would leave revocation as hand-written SQL, so
+    // a grant could only be taken away by someone with database access. Same narrow
+    // remit as the grant: Discord-namespace actors, this plugin's own actions only.
+    class PolicyRevokeTool extends PluginInterface {
+      static pluginID = 'discord';
+      static featureName = 'policy_revoke';
+      static displayName = 'Discord capability revoke';
+      static description = 'Remove a Discord user\'s right to feed a channel into a session, or to send from it.';
+      static riskLevel = 'high';
+      static inputSchema = {
+        type: 'object',
+        required: ['actor', 'action'],
+        properties: {
+          actor: { type: 'string', description: 'Discord user, as discord:<snowflake>' },
+          action: { type: 'string', enum: [...GRANTABLE_ACTIONS] },
+          channel: { type: 'string', description: 'Remove only the grant narrowed to this channel id' },
+          allScopes: {
+            type: 'boolean',
+            description: 'Also remove the unscoped grant. Without it only the named scope goes.',
+          },
+        },
+      };
+
+      async _execute(params = {}) {
+        let actor = String(params.actor || '').trim();
+        let action = String(params.action || '').trim();
+
+        if (!/^discord:\d+$/.test(actor)) {
+          return {
+            revoked: false,
+            reason: 'actor must look like discord:<numeric user id>; this tool cannot touch '
+              + 'authority outside the Discord namespace',
+          };
+        }
+        if (!GRANTABLE_ACTIONS.has(action)) {
+          return { revoked: false, reason: 'action "' + action + '" is not managed by this plugin' };
+        }
+
+        // Scope is named explicitly rather than inferred, because deleting "whatever
+        // matches" is how a revoke removes a grant the caller did not mean to touch.
+        let scope = params.channel ? { channel: String(params.channel) } : null;
+        let allScopes = params.allScopes === true;
+
+        let result = allScopes
+          ? await db().query(
+            'DELETE FROM discord_capability WHERE actor = $1 AND action = $2',
+            [actor, action],
+          )
+          : await db().query(
+            'DELETE FROM discord_capability WHERE actor = $1 AND action = $2 '
+              + 'AND scope_json IS NOT DISTINCT FROM $3::jsonb',
+            [actor, action, scope === null ? null : JSON.stringify(scope)],
+          );
+
+        let deleted = result?.rowCount ?? 0;
+
+        // Report the effect, not the intent. A delete that matched nothing, or one that
+        // left a broader grant in place, must not read as success - the same silent
+        // success this codebase keeps producing elsewhere.
+        let check = await authorize({ actor, action, scope: scope || {} });
+        return {
+          revoked: deleted > 0,
+          deleted,
+          verified: check.allowed !== true,
+          stillAllowed: check.allowed === true,
+          actor,
+          action,
+          scope,
+          allScopes,
+          note: deleted === 0
+            ? 'No matching grant existed; nothing was revoked.'
+            : check.allowed === true
+              ? 'Deleted ' + deleted + ' grant(s), but a broader grant still authorizes this action. '
+                + 'Repeat with allScopes: true to remove it.'
+              : 'Grant removed and no grant remains for this action.',
+        };
+      }
+    }
+
+    registry.registerTool('discord:policy_revoke', PolicyRevokeTool);
+
     // --- gateway -------------------------------------------------------------
     // Interactions arrive over HTTP, but ordinary channel messages only arrive over the
     // gateway websocket. Without it, a Discord channel is a one-way transport: replies
