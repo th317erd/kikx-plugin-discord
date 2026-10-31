@@ -18,7 +18,7 @@ import { DiscordInboundRouter } from './inbound-router.mjs';
 export const pluginName = 'discord';
 
 export function setup(provide) {
-  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig }) => {
+  return provide(({ context, registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig }) => {
     registerMigrations({ directory: 'sql' });
     let PluginInterface = registry.getClass('PluginInterface');
     if (!PluginInterface)
@@ -436,6 +436,9 @@ export function setup(provide) {
       // A typed write: the frame is a DiscordFrame, not a UserMessage pretending to
       // be one. appendToSession cannot express that - it hardcodes the type.
       appendFrame: (sessionID, input) => appendFrame(sessionID, input),
+      // Whoever receives the frame is decided by core from the session's coordinator.
+      // This only makes sure the session has one.
+      ensureSessionRecipient: (args) => ensureSessionRecipient(args),
       // Both live in the mapping table this transport owns.
       findFrame: (messageID) => db().one(
         'SELECT session_id, frame_id, original_text, edits, audit FROM discord_message_frame WHERE message_id = $1',
@@ -466,6 +469,61 @@ export function setup(provide) {
     async function refreshInboundConfig() {
       inbound.autoBindChannelID = await readConfig('/kikx/discord/inbound/channel', null);
       inbound.autoBindSessionID = await readConfig('/kikx/discord/inbound/session', null);
+    }
+
+    // Give the inbound session somebody to route to.
+    //
+    // The inbound session comes from configuration rather than from a human creating
+    // it, so it can exist with `participantAgentIDs: []` and `coordinatorAgentID: null`.
+    // Core routes every frame to the session coordinator and `AgentRouteFramePlugin`
+    // returns early when there is none, so in that state an inbound Discord message is
+    // written, is readable, and wakes nobody: accepted and silently unrouted.
+    //
+    // `inviteAgentToSession` is the supported path out of that state. It adds the
+    // participant AND re-resolves the session tree, which force-promotes a coordinator
+    // for a root session that has just gained its first bot. That promotion is core's
+    // rule, not ours; this transport only supplies the missing member.
+    //
+    // Resolved lazily rather than at setup time: plugins are loaded before the frame
+    // runtime exists in the container (create-server sets it after loadPlugins), so a
+    // captured reference here would be null for the life of the process.
+    async function ensureSessionRecipient({ sessionID }) {
+      let runtime = context?.has?.('frameRuntime') ? context.require('frameRuntime') : null;
+      let agentManager = context?.has?.('agentManager') ? context.require('agentManager') : null;
+      if (typeof runtime?.inviteAgentToSession !== 'function') return;
+      if (typeof agentManager?.resolveAgent !== 'function') return;
+
+      // Never second-guess a session that already has members: a human may have
+      // curated the participant list, and adding to it would be our policy, not theirs.
+      let session = runtime.getSession?.(sessionID) || null;
+      if (Array.isArray(session?.participantAgentIDs) && session.participantAgentIDs.length > 0)
+        return;
+
+      let agent = await resolveInboundAgent(agentManager);
+      if (!agent) return;
+
+      let result = await runtime.inviteAgentToSession(sessionID, agent, { invitedByAgentID: null });
+      if (result?.alreadyParticipant === true) return;
+      console.log(`[discord] invited ${agent.name || agent.id} into ${sessionID} so inbound messages have a coordinator to route to`);
+    }
+
+    // Which agent should own inbound traffic here.
+    //
+    // Explicit configuration wins. Falling back to "the only enabled agent" is
+    // deliberately narrow: on an instance with exactly one bot there is no ambiguity
+    // about who the operator means, and doing nothing quietly would leave messages on
+    // the floor, which is the defect. With two or more agents it declines rather than
+    // guessing - picking one of several is a policy decision this transport has no
+    // standing to make.
+    async function resolveInboundAgent(agentManager) {
+      let configured = await readConfig('/kikx/discord/inbound/agent', null);
+      if (typeof configured === 'string' && configured.trim() !== '')
+        return await agentManager.resolveAgent(configured.trim());
+
+      let listing = await agentManager.listAgents({ limit: 100 });
+      let agents = Array.isArray(listing) ? listing : (listing?.agents || []);
+      let enabled = agents.filter((entry) => entry && entry.enabled !== false && entry.id);
+      return enabled.length === 1 ? enabled[0] : null;
     }
 
     async function gatewayLoop() {

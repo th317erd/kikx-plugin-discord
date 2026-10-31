@@ -37,6 +37,12 @@ export class DiscordInboundRouter {
   //   log                 (level, message) => void
   //   botUserID           () => string | null   — read lazily; READY arrives after start
   //   autoBindChannelID   string | null — optional channel to bind to `autoBindSessionID`
+  //   ensureSessionRecipient async ({ sessionID, channelID }) => void  (optional)
+  //     Called once a channel has resolved to a session and before the frame is
+  //     written. A bound channel is not the same thing as a session somebody is
+  //     listening in; core routes every frame to the session coordinator, and a
+  //     session with no participants has none, so the message is stored and then
+  //     never delivered. The host owns the participant policy, so this only asks.
   //   autoBindSessionID   string | null
   constructor(options = {}) {
     this.findChannelSession = options.findChannelSession;
@@ -48,6 +54,9 @@ export class DiscordInboundRouter {
     this.findFrame = options.findFrame || (async () => null);
     this.updateFrameAudit = options.updateFrameAudit || (async () => {});
     this.appendFrame = options.appendFrame;
+    // Optional. Absent means "do not manage participants", which keeps the router
+    // usable by tests and by any host that curates its own sessions.
+    this.ensureSessionRecipient = options.ensureSessionRecipient || null;
     this.log = options.log || (() => {});
     this.botUserID = options.botUserID || (() => null);
     // Required, not optional. A router that silently skips authorization when none is
@@ -246,6 +255,16 @@ export class DiscordInboundRouter {
     }
     if (!binding || !binding.session_id)
       return { handled: false, reason: 'unbound_channel', channelID };
+
+    if (typeof this.ensureSessionRecipient === 'function') {
+      // Deliberately non-fatal. A participant the host cannot supply must not cost
+      // us the message; the frame is still recorded and the reason is logged.
+      try {
+        await this.ensureSessionRecipient({ sessionID: binding.session_id, channelID });
+      } catch (error) {
+        this.log('warn', `discord: could not ensure a recipient for session ${binding.session_id}: ${error.message}`);
+      }
+    }
 
     let sessionID = binding.session_id;
     let text = `[discord:${authorName}] ${content}`;
