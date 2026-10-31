@@ -12,7 +12,7 @@ function makeRouter(overrides = {}) {
     bindChannelSession: async (input) => { calls.bound.push(input); },
     recordFrame: async (input) => { calls.recorded.push(input); },
     seenMessage: async () => false,
-    appendToSession: async (sessionID, input) => {
+    appendFrame: async (sessionID, input) => {
       calls.appended.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
     },
@@ -145,7 +145,7 @@ test('a reply (type 19) is framed like a normal message', async () => {
 
 test('a failing append propagates, so the caller sees the failure rather than a silent drop', async () => {
   let { router } = makeRouter({
-    appendToSession: async () => { throw new Error('frame runtime unavailable'); },
+    appendFrame: async () => { throw new Error('frame runtime unavailable'); },
   });
   await assert.rejects(
     () => router.handle('MESSAGE_CREATE', message()),
@@ -154,6 +154,6 @@ test('a failing append propagates, so the caller sees the failure rather than a 
 });
 
 test('construction refuses without the two dependencies that make routing meaningful', () => {
-  assert.throws(() => new DiscordInboundRouter({}), /appendToSession/);
-  assert.throws(() => new DiscordInboundRouter({ appendToSession: async () => {} }), /findChannelSession/);
+  assert.throws(() => new DiscordInboundRouter({}), /appendFrame/);
+  assert.throws(() => new DiscordInboundRouter({ appendFrame: async () => {} }), /findChannelSession/);
 });

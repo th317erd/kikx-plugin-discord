@@ -50,11 +50,12 @@ function buildHarness({ grants = [] } = {}) {
     registry: {
       getClass: () => class { },
       registerTool: (name, cls) => captured.tools.push({ name, cls }),
+      registerClass: () => {},
     },
     mountHttp: () => { },
     registerMigrations: () => { },
     readConfig: async () => null,
-    appendToSession: async () => ({}),
+    appendFrame: async () => ({}),
     appendToSessionQuietly: async () => ({}),
     db: () => db,
     authorize: async ({ actor, action, scope = {} }) => {

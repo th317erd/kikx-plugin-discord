@@ -55,7 +55,7 @@ function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
   });
 
   let context = {
-    registry: { getClass: () => FakePluginInterface, registerTool: () => {} },
+    registry: { getClass: () => FakePluginInterface, registerTool: () => {}, registerClass: () => {} },
     registerMigrations: () => {},
     mountHttp: (handler, options) => {
       state.handler = handler;
@@ -69,7 +69,7 @@ function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
         : { allowed: false, reason: 'no grant for discord.inbound' };
     },
     db,
-    appendToSession: async (sessionID, input) => {
+    appendFrame: async (sessionID, input) => {
       state.frames.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
     },

@@ -15,6 +15,14 @@
 // (joins, pins, boosts, calls) has no text worth framing.
 const FRAMEABLE_MESSAGE_TYPES = new Set([0, 19]);
 
+// The frame type this plugin writes into a session.
+//
+// It is registered as a frame-type class in index.mjs with `static agentOnly`,
+// which is what makes the frame hidden from the transcript while the agent still
+// receives it. `hidden: true` cannot do that: it removes the frame from model
+// context, so the bot never reads the message.
+const DISCORD_FRAME_TYPE = 'DiscordFrame';
+
 // A newline, named rather than written as an escape inline. The diff below splits
 // message text on it, and an inline escape is exactly what got mis-quoted twice.
 const NEWLINE = String.fromCharCode(10);
@@ -25,7 +33,7 @@ export class DiscordInboundRouter {
   //   bindChannelSession  async ({ channelID, sessionID }) => void
   //   recordFrame         async ({ messageID, sessionID, frameID, text }) => void
   //   seenMessage         async (messageID) => boolean   — dedupe across reconnects
-  //   appendToSession     async (sessionID, input) => frame   (waking)
+  //   appendFrame         async (sessionID, input) => frame   (waking, typed)
   //   log                 (level, message) => void
   //   botUserID           () => string | null   — read lazily; READY arrives after start
   //   autoBindChannelID   string | null — optional channel to bind to `autoBindSessionID`
@@ -39,7 +47,7 @@ export class DiscordInboundRouter {
     // has to be readable and writable from here rather than from the caller.
     this.findFrame = options.findFrame || (async () => null);
     this.updateFrameAudit = options.updateFrameAudit || (async () => {});
-    this.appendToSession = options.appendToSession;
+    this.appendFrame = options.appendFrame;
     this.log = options.log || (() => {});
     this.botUserID = options.botUserID || (() => null);
     // Required, not optional. A router that silently skips authorization when none is
@@ -48,8 +56,8 @@ export class DiscordInboundRouter {
     this.autoBindChannelID = options.autoBindChannelID || null;
     this.autoBindSessionID = options.autoBindSessionID || null;
 
-    if (typeof this.appendToSession !== 'function')
-      throw new Error('DiscordInboundRouter requires appendToSession');
+    if (typeof this.appendFrame !== 'function')
+      throw new Error('DiscordInboundRouter requires appendFrame');
     if (typeof this.findChannelSession !== 'function')
       throw new Error('DiscordInboundRouter requires findChannelSession');
     if (typeof this.authorizeInbound !== 'function')
@@ -127,10 +135,16 @@ export class DiscordInboundRouter {
     let existingAudit = Array.isArray(row.audit) ? row.audit : [];
     let audit = [...existingAudit, entry];
 
-    await this.appendToSession(row.session_id, {
+    await this.appendFrame(row.session_id, {
       id: row.frame_id,
       text: row.original_text,
       source: 'discord',
+      // Re-sent on an edit for the same reason as the first append: core honours
+      // these fields, and an edit that omitted them would present the message as
+      // the owner's and redraw it in the transcript.
+      type: DISCORD_FRAME_TYPE,
+      authorID: `discord:${actorID}`,
+      authorDisplayName: data.author?.username || 'discord',
       // The audit tail must ride inside content: buildUserMessageContent keeps extra
       // fields from input.content, so a top-level audit was silently dropped.
       content: { audit },
@@ -236,16 +250,27 @@ export class DiscordInboundRouter {
     let sessionID = binding.session_id;
     let text = `[discord:${authorName}] ${content}`;
 
-    let frame = await this.appendToSession(sessionID, {
+    let frame = await this.appendFrame(sessionID, {
       text,
       source: 'discord',
+      // The frame is not the owner speaking. Without the author fields it is
+      // presented as the owner's own message, which is both wrong and
+      // untraceable; core attributes the turn from these
+      // (FrameTypeUserMessage.getAuthorDisplayName).
+      type: DISCORD_FRAME_TYPE,
+      authorID: `discord:${authorID}`,
+      // The bare Discord handle, with no " (Discord)" suffix. The type says where
+      // the message came from; decorating the display name made the owner's own
+      // name look like a different person and was the wrong fix for the wrong
+      // mechanism.
+      authorDisplayName: authorName,
       // The message id travels with the frame so an edit can find it again, and so a
       // reconnect replay can be recognised as the same frame rather than a new one.
-      content: { discord: { messageID, channelID, authorName } },
+      content: { discord: { messageID, channelID, authorName, authorID } },
     });
 
-    // appendToSession returns { session, frame, commit, wakePending }: the frame id is
-    // one level down. Reading frame.id directly silently records no mapping at all.
+    // appendFrame returns { session, frame, commit, wakePending }: the frame id is one
+    // level down. Reading frame.id directly silently records no mapping at all.
     let frameID = frame?.frame?.id || frame?.id || null;
     await this.recordFrame({ messageID, sessionID, frameID, text });
     return { handled: true, sessionID, frameID, messageID };

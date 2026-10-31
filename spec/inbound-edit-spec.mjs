@@ -29,7 +29,7 @@ function makeRouter(overrides = {}) {
       audit: [],
     }),
     updateFrameAudit: async (input) => { calls.auditUpdates.push(input); },
-    appendToSession: async (sessionID, input) => {
+    appendFrame: async (sessionID, input) => {
       calls.appended.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
     },

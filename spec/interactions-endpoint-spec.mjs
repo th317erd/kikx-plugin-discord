@@ -50,7 +50,7 @@ function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), 
   });
 
   let context = {
-    registry: { getClass: () => FakePluginInterface, registerTool: () => {} },
+    registry: { getClass: () => FakePluginInterface, registerTool: () => {}, registerClass: () => {} },
     registerMigrations: () => {},
     mountHttp: (handler, options) => {
       captured.handler = handler;
@@ -66,7 +66,7 @@ function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), 
         : { allowed: true };
     },
     db,
-    appendToSession: async (sessionID, input) => {
+    appendFrame: async (sessionID, input) => {
       captured.frames.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: `frame-${captured.frames.length}` } };
     },

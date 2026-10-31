@@ -44,7 +44,7 @@ class FakeSocket {
 class FakePluginInterface {}
 
 function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allowed = true } = {}) {
-  let captured = { mounts: [], migrations: [], tools: [], frames: [], queries: [], authorizations: [] };
+  let captured = { mounts: [], migrations: [], tools: [], classes: [], frames: [], queries: [], authorizations: [] };
 
   let db = () => ({
     async one(sql, params) {
@@ -60,6 +60,9 @@ function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allo
     registry: {
       getClass: () => FakePluginInterface,
       registerTool: (name) => captured.tools.push(name),
+      // The real registry carries the class registry; the plugin registers its own
+      // frame type through it, so the double has to expose the same capability.
+      registerClass: (key, ClassRef) => captured.classes.push({ key, ClassRef }),
     },
     registerMigrations: (options) => captured.migrations.push(options),
     mountHttp: (handler, options) => {
@@ -75,7 +78,9 @@ function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allo
         : { allowed: false, reason: 'no grant for discord.inbound' };
     },
     db,
-    appendToSession: async (sessionID, input) => {
+    // The router writes through appendFrame, not appendToSession: the frame needs a
+    // type of its own. Assertions still read captured.frames.
+    appendFrame: async (sessionID, input) => {
       captured.frames.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
     },

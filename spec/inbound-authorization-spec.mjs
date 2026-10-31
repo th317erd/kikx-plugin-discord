@@ -40,7 +40,7 @@ function makeRouter(overrides = {}) {
     bindChannelSession: async (input) => { calls.bound.push(input); },
     recordFrame: async (input) => { calls.recorded.push(input); },
     seenMessage: async () => false,
-    appendToSession: async (sessionID, input) => {
+    appendFrame: async (sessionID, input) => {
       calls.appended.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
     },
@@ -81,7 +81,7 @@ test('a denied sender produces no frame, no frame record, and no binding', async
   // The refusal reason must survive to the caller; "denied" without a why is unactionable.
   assert.match(result.detail, /no grant/);
 
-  assert.equal(calls.appended.length, 0, 'a denied sender must not reach appendToSession');
+  assert.equal(calls.appended.length, 0, 'a denied sender must not reach appendFrame');
   assert.equal(calls.recorded.length, 0, 'a denied sender must not be recorded as framed');
   assert.equal(calls.bound.length, 0, 'a denied sender must never create a binding');
 });
@@ -140,7 +140,7 @@ test('a router constructed with no gate throws instead of framing unguarded', as
   // simply framed everything. Making it required turns that silent hole into a startup
   // failure, which is where it can actually be noticed.
   assert.throws(
-    () => new DiscordInboundRouter({ findChannelSession: async () => null, appendToSession: async () => {} }),
+    () => new DiscordInboundRouter({ findChannelSession: async () => null, appendFrame: async () => {} }),
     /requires authorizeInbound/,
   );
 });

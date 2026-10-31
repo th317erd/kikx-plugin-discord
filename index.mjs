@@ -18,7 +18,7 @@ import { DiscordInboundRouter } from './inbound-router.mjs';
 export const pluginName = 'discord';
 
 export function setup(provide) {
-  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendToSessionQuietly, readConfig }) => {
+  return provide(({ registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig }) => {
     registerMigrations({ directory: 'sql' });
     let PluginInterface = registry.getClass('PluginInterface');
     if (!PluginInterface)
@@ -382,6 +382,35 @@ export function setup(provide) {
       };
     }
 
+    // The frame type this transport writes into a session.
+    //
+    // Extends the core UserMessage class resolved through the registry rather than
+    // importing it, so this plugin declares its own behaviour without depending on a
+    // core module path. `static agentOnly = true` is the whole point: core stamps
+    // `agentOnly` on every frame written with this type, which keeps the frame out of
+    // the session transcript while still delivering it to the agent. The alternative,
+    // `hidden: true`, is filtered out of model context and would leave the bot deaf.
+    //
+    // `getAuthorDisplayName` returns the Discord handle: a Discord message is neither
+    // the owner speaking nor an agent, and saying so on the card is what makes the
+    // frame traceable when it is revealed.
+    let UserMessageBase = registry.getClass('FrameTypeUserMessage');
+    if (typeof UserMessageBase !== 'function')
+      throw new Error('kikx-plugin-discord requires FrameTypeUserMessage in the class registry');
+
+    class FrameTypeDiscordFrame extends UserMessageBase {
+      static agentOnly = true;
+
+      getAuthorDisplayName() {
+        let name = this._frameData?.content?.discord?.authorName
+          || this._frameData?.authorDisplayName
+          || 'Discord';
+        return `${name} (Discord)`;
+      }
+    }
+
+    registry.registerClass('FrameTypeDiscordFrame', FrameTypeDiscordFrame);
+
     // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
     // a database, or a session runtime. Every effect it needs is bound here.
     let inbound = new DiscordInboundRouter({
@@ -404,6 +433,9 @@ export function setup(provide) {
         [messageID],
       )),
       appendToSession: (sessionID, input) => appendToSession(sessionID, input),
+      // A typed write: the frame is a DiscordFrame, not a UserMessage pretending to
+      // be one. appendToSession cannot express that - it hardcodes the type.
+      appendFrame: (sessionID, input) => appendFrame(sessionID, input),
       // Both live in the mapping table this transport owns.
       findFrame: (messageID) => db().one(
         'SELECT session_id, frame_id, original_text, edits, audit FROM discord_message_frame WHERE message_id = $1',
