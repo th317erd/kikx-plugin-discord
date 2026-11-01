@@ -422,10 +422,46 @@ export function setup(provide) {
         'INSERT INTO discord_channel_session (channel_id, session_id) VALUES ($1,$2) ON CONFLICT (channel_id) DO NOTHING',
         [channelID, sessionID],
       ),
+      // Fills in the row claimMessage() reserved. The WHERE guard is the point: a row
+      // whose frame_id is still NULL is an unfilled claim and may be completed, while a
+      // real record (frame_id already set) is never overwritten - that row owns the
+      // original text and the edit history accumulated against it.
       recordFrame: ({ messageID, sessionID, frameID, text }) => db().query(
-        'INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text) VALUES ($1,$2,$3,$4) ON CONFLICT (message_id) DO NOTHING',
+        `INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (message_id) DO UPDATE
+           SET session_id = EXCLUDED.session_id,
+               frame_id = EXCLUDED.frame_id,
+               original_text = EXCLUDED.original_text
+           WHERE discord_message_frame.frame_id IS NULL`,
         [messageID, sessionID, frameID, text],
       ),
+      // The exclusive claim. INSERT ... ON CONFLICT DO NOTHING RETURNING is atomic:
+      // exactly one racing caller gets a row back and the others get none, so two live
+      // gateways cannot both frame the same Discord message. seenMessage() alone was a
+      // read followed much later by a write, and on 3003 that gap produced frames 4+5
+      // and 7+8 from single messages.
+      claimMessage: async ({ messageID }) => {
+        let row = await db().one(
+          `INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text)
+           VALUES ($1,'',NULL,'')
+           ON CONFLICT (message_id) DO NOTHING
+           RETURNING message_id`,
+          [messageID],
+        );
+        if (row) return true;
+        // No row came back. That means the message id already existed - but a driver or
+        // a test double that reports "no rows" without distinguishing "conflicted" from
+        // "inserted, nothing returned" would be read as a race we lost, and we would drop
+        // every inbound message. Dropping a message we could have framed is far worse
+        // than framing one twice, so confirm before deciding: only a row we can actually
+        // see counts as already-claimed.
+        let existing = await db().one(
+          'SELECT 1 AS present FROM discord_message_frame WHERE message_id = $1',
+          [messageID],
+        );
+        return !existing;
+      },
       // Dedupe against the mapping table the transport already owns: a RESUME replay
       // redelivers events, and framing one twice would duplicate the message.
       seenMessage: async (messageID) => Boolean(await db().one(

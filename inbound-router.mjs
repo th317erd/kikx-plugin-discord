@@ -33,6 +33,11 @@ export class DiscordInboundRouter {
   //   bindChannelSession  async ({ channelID, sessionID }) => void
   //   recordFrame         async ({ messageID, sessionID, frameID, text }) => void
   //   seenMessage         async (messageID) => boolean   — dedupe across reconnects
+  //   claimMessage        async ({ messageID, sessionID }) => boolean
+  //     Insert the message row and report whether THIS caller won it. Optional; when
+  //     absent the router falls back to seenMessage() and the old check-then-write
+  //     window. When present it is the exclusive claim: exactly one concurrent
+  //     handler can frame a given Discord message, even across two live gateways.
   //   appendFrame         async (sessionID, input) => frame   (waking, typed)
   //   log                 (level, message) => void
   //   botUserID           () => string | null   — read lazily; READY arrives after start
@@ -49,6 +54,10 @@ export class DiscordInboundRouter {
     this.bindChannelSession = options.bindChannelSession || (async () => {});
     this.recordFrame = options.recordFrame || (async () => {});
     this.seenMessage = options.seenMessage || (async () => false);
+    // Optional exclusive claim. Preferred over seenMessage() where the host can offer
+    // it: two live gateway instances both answering MESSAGE_CREATE is exactly how one
+    // channel message became two frames on 3003.
+    this.claimMessage = options.claimMessage || null;
     // The edit path updates the frame a message already became, so the mapping row
     // has to be readable and writable from here rather than from the caller.
     this.findFrame = options.findFrame || (async () => null);
@@ -221,7 +230,11 @@ export class DiscordInboundRouter {
     if (botID && authorID === botID) return { handled: false, reason: 'own_message' };
     if (author?.bot === true) return { handled: false, reason: 'bot_author' };
 
-    if (await this.seenMessage(messageID))
+    // Cheap first look. A redelivery of a message we already hold stops here, before
+    // authorization and before anything is written. This is only a look, not a
+    // reservation - the authoritative claim happens immediately before the frame is
+    // written, because a check here and a write seventy lines later is a race.
+    if (typeof this.claimMessage !== 'function' && await this.seenMessage(messageID))
       return { handled: false, reason: 'duplicate' };
 
     // -----------------------------------------------------------------------
@@ -268,6 +281,24 @@ export class DiscordInboundRouter {
 
     let sessionID = binding.session_id;
     let text = `[discord:${authorName}] ${content}`;
+
+    // The exclusive claim, immediately before the write.
+    //
+    // Seen-and-write used to be a read at the top of this method and a recordFrame()
+    // some seventy lines and several awaits later. Two handlers - two live gateway
+    // instances, or a RESUME replay overlapping a fresh create - both read "not seen",
+    // both appended, and recordFrame()'s ON CONFLICT DO NOTHING silently dropped the
+    // second mapping row. That is exactly how the live store ended up with six
+    // DiscordFrame rows for four distinct message ids (orders 4+5 and 7+8).
+    //
+    // claimMessage() settles it in one statement: INSERT ... ON CONFLICT DO NOTHING
+    // RETURNING. Exactly one caller gets the row. Everything fallible (authorization,
+    // binding, recipient resolution) has already happened above, so a denial still
+    // reports its own reason rather than being masked as a duplicate.
+    if (typeof this.claimMessage === 'function') {
+      let won = await this.claimMessage({ messageID, sessionID });
+      if (won === false) return { handled: false, reason: 'duplicate' };
+    }
 
     let frame = await this.appendFrame(sessionID, {
       text,
