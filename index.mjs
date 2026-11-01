@@ -527,6 +527,23 @@ export function setup(provide) {
     }
 
     async function gatewayLoop() {
+      // Never run two gateways from one plugin instance.
+      //
+      // Core's reload path now calls onShutdown (which sets stopped and retires the
+      // gateway), but that hook was skipped for a long time and cost real damage: on
+      // 3003 four gateways ended up live against one bot token, Discord closed the
+      // duplicates with code 4000, and one channel message was framed twice because two
+      // gateways both handled it. A transport must not depend on the host getting the
+      // lifecycle exactly right, so this refuses to open a second connection and says so.
+      if (stopped) {
+        console.warn('[discord] gateway not started: plugin instance has been shut down');
+        return;
+      }
+      if (gateway) {
+        console.warn('[discord] gateway already running for this plugin instance; not starting another');
+        return;
+      }
+
       let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
       if (!token) {
         // No token: say so once and stop. Reconnect-spinning on a missing credential is
