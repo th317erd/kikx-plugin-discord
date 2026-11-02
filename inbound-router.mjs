@@ -27,6 +27,66 @@ const DISCORD_FRAME_TYPE = 'DiscordFrame';
 // message text on it, and an inline escape is exactly what got mis-quoted twice.
 const NEWLINE = String.fromCharCode(10);
 
+// ---------------------------------------------------------------------------
+// What a message CARRIES, not only what it says
+// ---------------------------------------------------------------------------
+// MEASURED DEFECT this replaces: the router never read data.attachments, embeds
+// or sticker_items (grep returned zero hits), and the emptiness gate below
+// reported 'empty_content_missing_intent'. So a pasted screenshot with no
+// caption -- the ordinary case -- was dropped at that gate with a reason that
+// blamed a Discord privileged intent for what was actually a missing media
+// reader. A captioned image was quieter-still: it was delivered, but the frame
+// text was only the caption, so "see above" reached the agent as the words
+// "see above" and nothing else. An embed the agent cannot see is a message
+// half-delivered.
+//
+// The URLs are included deliberately. Without a URL the agent is told an image
+// exists and is given no way to reach it, which is the same class of failure
+// wearing a friendlier face.
+export function describeMessageMedia(data) {
+  if (!data || typeof data !== 'object') return '';
+
+  let lines = [];
+
+  for (let attachment of Array.isArray(data.attachments) ? data.attachments : []) {
+    if (!attachment || typeof attachment !== 'object') continue;
+    let name = typeof attachment.filename === 'string' && attachment.filename.trim()
+      ? attachment.filename.trim()
+      : (attachment.id ? 'attachment-' + attachment.id : 'attachment');
+    let details = [];
+    if (typeof attachment.content_type === 'string' && attachment.content_type.trim())
+      details.push(attachment.content_type.trim());
+    if (Number.isFinite(attachment.size)) details.push(attachment.size + ' bytes');
+    if (Number.isFinite(attachment.width) && Number.isFinite(attachment.height))
+      details.push(attachment.width + 'x' + attachment.height);
+    let url = typeof attachment.url === 'string' && attachment.url.trim()
+      ? attachment.url.trim()
+      : (typeof attachment.proxy_url === 'string' ? attachment.proxy_url.trim() : '');
+    let label = details.length ? name + ' (' + details.join(', ') + ')' : name;
+    lines.push(url ? '[attachment: ' + label + ' ' + url + ']' : '[attachment: ' + label + ']');
+  }
+
+  for (let embed of Array.isArray(data.embeds) ? data.embeds : []) {
+    if (!embed || typeof embed !== 'object') continue;
+    let title = typeof embed.title === 'string' ? embed.title.trim() : '';
+    let description = typeof embed.description === 'string' ? embed.description.trim() : '';
+    let url = typeof embed.url === 'string' ? embed.url.trim() : '';
+    let label = title || description || 'embed';
+    if (title && description) label += ' — ' + description;
+    lines.push(url ? '[embed: ' + label + ' ' + url + ']' : '[embed: ' + label + ']');
+  }
+
+  for (let sticker of Array.isArray(data.sticker_items) ? data.sticker_items : []) {
+    if (!sticker || typeof sticker !== 'object') continue;
+    let name = typeof sticker.name === 'string' && sticker.name.trim()
+      ? sticker.name.trim()
+      : (sticker.id ? 'sticker-' + sticker.id : 'sticker');
+    lines.push('[sticker: ' + name + ']');
+  }
+
+  return lines.join('\n');
+}
+
 export class DiscordInboundRouter {
   // options:
   //   findChannelSession  async (channelID) => { session_id } | null
@@ -211,13 +271,21 @@ export class DiscordInboundRouter {
       return { handled: false, reason: 'unsupported_type' };
 
     // MESSAGE_CONTENT is privileged. When it is off, Discord sends the message anyway
-    // with empty content — so this is the only signal that the intent is missing, and
-    // it must be reported rather than dropped silently.
+    // with empty content — so this is the only signal that the intent is missing. It is
+    // still reported, but only when there is genuinely NOTHING to frame: attachments,
+    // embeds and stickers arrive whether or not the content intent is granted, so a
+    // message with media is delivered on its media rather than dropped as "empty".
     let content = (typeof data.content === 'string' ? data.content : '')
       || (typeof data.data?.content === 'string' ? data.data.content : '')
       || String(data.data?.options?.find?.((o) => o.name === 'message')?.value ?? '');
     content = content.trim();
-    if (!content) return { handled: false, reason: 'empty_content_missing_intent' };
+
+    // The caption comes first and the media description after it, because the human's
+    // words are the message and the file is context. An attachment-only message has no
+    // caption, so the media description stands alone as the content.
+    let media = describeMessageMedia(data);
+    if (!content && !media) return { handled: false, reason: 'empty_content_missing_intent' };
+    if (media) content = content ? content + '\n' + media : media;
 
     let messageID = data.id;
     let channelID = data.channel_id || data.channel?.id || null;
