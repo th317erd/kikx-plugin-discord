@@ -12,10 +12,20 @@
 // =============================================================================
 
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { DiscordGateway, DEFAULT_INTENTS } from './gateway.mjs';
 import { DiscordInboundRouter } from './inbound-router.mjs';
 
 export const pluginName = 'discord';
+
+// The card the client draws for an outbound reply. Registered by declaring it on
+// the tool: PluginRegistry.registerTool() turns `frameType` + `clientComponent`
+// into a frame component, which is how the client learns to render
+// DiscordSendToolFrame instead of the generic tool card. No core change.
+const SEND_CARD_TAG = 'kikx-discord-send-card';
+const SEND_CARD_URL = '/api/plugins/discord/client/discord-send-card.mjs';
+const SEND_CARD_FILE = fileURLToPath(new URL('./client/discord-send-card.mjs', import.meta.url));
 
 export function setup(provide) {
   return provide(({ context, registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig }) => {
@@ -107,6 +117,10 @@ export function setup(provide) {
       static description = 'Send a message to a Discord channel. Requires a capability grant.';
       static version = '0.1.0';
       static riskLevel = 'none';   // authorization is explicit below, not via a UI prompt
+      // Derived by core when a tool does not name one; named here so the client
+      // component below is attached to the type that is actually written.
+      static frameType = 'DiscordSendToolFrame';
+      static clientComponent = { tagName: SEND_CARD_TAG, moduleURL: SEND_CARD_URL };
       static inputSchema = {
         type: 'object',
         required: ['actor', 'channel', 'content'],
@@ -680,6 +694,27 @@ export function setup(provide) {
 
         response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ ok: true, ...gatewaySnapshot() }));
+        return;
+      }
+
+      // --- client renderer ------------------------------------------------------
+      // A browser imports this module with no Kikx session attached, so the route
+      // cannot be identity-gated: a 401 here would leave DiscordSendToolFrame
+      // with no renderer and the card would fall back to a generic tool frame.
+      // It serves one static file this plugin already ships, and nothing else.
+      if (request.method === 'GET' && subPath === '/client/discord-send-card.mjs') {
+        let body;
+        try { body = await readFile(SEND_CARD_FILE); }
+        catch (error) {
+          response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+          response.end(JSON.stringify({ error: { message: 'discord client module not found' } }));
+          return;
+        }
+        response.writeHead(200, {
+          'Content-Type': 'text/javascript; charset=utf-8',
+          'Cache-Control': 'no-cache',
+        });
+        response.end(body);
         return;
       }
 
