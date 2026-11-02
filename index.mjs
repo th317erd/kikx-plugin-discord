@@ -16,6 +16,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { DiscordGateway, DEFAULT_INTENTS } from './gateway.mjs';
 import { DiscordInboundRouter } from './inbound-router.mjs';
+import { DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from './message-split.mjs';
 
 export const pluginName = 'discord';
 
@@ -84,9 +85,18 @@ export function setup(provide) {
     // the deferred placeholder instead of posting a second message. This runs after the
     // HTTP response has been sent, so a failure here has no status code left to occupy:
     // it is logged, and the placeholder is what the user is left looking at.
-    async function updateInteractionOriginal({ applicationID, interactionToken, content }) {
+    async function updateInteractionOriginal({ applicationID, interactionToken, channelID, content }) {
       let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
       if (!token) return { ok: false, pending: 'no-bot-token' };
+
+      // An interaction has exactly ONE @original message, so the first chunk edits
+      // the deferred placeholder and any remainder is posted as follow-up channel
+      // messages, in order. This used to be slice(0, 2000): everything past the
+      // limit was discarded while the call still reported success. A truncated
+      // reply is worse than a split one because it looks complete. See
+      // message-split.mjs.
+      let chunks = splitDiscordMessage(content, DISCORD_MESSAGE_LIMIT);
+      if (chunks.length === 0) chunks = [ '' ];
 
       try {
         let res = await fetch(
@@ -99,12 +109,46 @@ export function setup(provide) {
               'Content-Type': 'application/json',
               'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
             },
-            body: JSON.stringify({ content: String(content).slice(0, 2000) }),
+            body: JSON.stringify({ content: chunks[0] }),
           },
         );
         if (!res.ok)
           return { ok: false, status: res.status, error: (await res.text().catch(() => '')).slice(0, 300) };
-        return { ok: true };
+
+        let overflow = chunks.length - 1;
+        if (overflow === 0)
+          return { ok: true, chunks: 1, overflow: 0 };
+
+        // The remainder needs a real channel. Without one the first chunk still
+        // reached the user, so this is reported rather than thrown.
+        if (!channelID) {
+          console.warn(
+            '[discord] reply split into ' + chunks.length + ' parts but the interaction carried no channel id; only the first was delivered',
+          );
+          return { ok: true, chunks: 1, overflow, truncated: true };
+        }
+
+        let delivered = 1;
+        for (let chunk of chunks.slice(1)) {
+          let posted = await fetch(
+            'https://discord.com/api/v10/channels/' + encodeURIComponent(channelID) + '/messages',
+            {
+              method: 'POST',
+              headers: {
+                Authorization: 'Bot ' + token,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
+              },
+              body: JSON.stringify({ content: chunk }),
+            },
+          );
+          if (!posted.ok)
+            return { ok: false, chunks: delivered, overflow, status: posted.status,
+              error: (await posted.text().catch(() => '')).slice(0, 300) };
+          delivered += 1;
+        }
+
+        return { ok: true, chunks: delivered, overflow: 0 };
       } catch (error) {
         return { ok: false, error: String(error?.message || error) };
       }
@@ -211,34 +255,78 @@ export function setup(provide) {
         // tool call (enrichToolInput), so the transport can answer that itself.
         let replyTo = await findReplyTarget(params._sessionID);
         let replyToField = replyTo ? { replyTo } : {};
-        let res;
-        try {
-          res = await fetch(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bot ${token}`,
-              'Content-Type': 'application/json',
-              'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
-            },
-            body: JSON.stringify({ content: String(params.content).slice(0, 2000) }),
-          });
-        } catch (error) {
-          return { sent: false, authorized: true, error: String(error?.message || error), ...replyToField };
+        // A reply longer than one Discord message is sent as several, in order.
+        // This used to be slice(0, 2000): the tail was discarded and the call still
+        // reported success, so an agent believed it had answered fully and the human
+        // received a reply that stopped mid-sentence with no marker anywhere. See
+        // message-split.mjs.
+        let chunks = splitDiscordMessage(params.content, DISCORD_MESSAGE_LIMIT);
+        if (chunks.length === 0)
+          return { sent: false, authorized: true, error: 'content is empty', ...replyToField };
+
+        let messageIDs = [];
+        let firstResponse = null;
+        for (let chunk of chunks) {
+          let res;
+          try {
+            res = await fetch(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bot ${token}`,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
+              },
+              body: JSON.stringify({ content: chunk }),
+            });
+          } catch (error) {
+            return {
+              sent: messageIDs.length > 0,
+              authorized: true,
+              channel: channelId,
+              messageID: messageIDs[0] || null,
+              messageIDs,
+              chunks: chunks.length,
+              deliveredChunks: messageIDs.length,
+              error: String(error?.message || error),
+              ...replyToField,
+            };
+          }
+
+          if (!res.ok) {
+            let detail = await res.text().catch(() => '');
+            // A partial send is reported as such: some text DID land, so saying
+            // "not sent" would be false, and saying "sent" would hide the gap.
+            return {
+              sent: messageIDs.length > 0,
+              authorized: true,
+              channel: channelId,
+              status: res.status,
+              messageID: messageIDs[0] || null,
+              messageIDs,
+              chunks: chunks.length,
+              deliveredChunks: messageIDs.length,
+              error: detail.slice(0, 300),
+              ...replyToField,
+            };
+          }
+
+          firstResponse = firstResponse || res;
+          let posted = await res.json().catch(() => null);
+          if (posted?.id)
+            messageIDs.push(posted.id);
         }
 
-        if (!res.ok) {
-          let detail = await res.text().catch(() => '');
-          return { sent: false, authorized: true, status: res.status, error: detail.slice(0, 300), ...replyToField };
-        }
-
-        let body = await res.json().catch(() => null);
         return {
-          sent: true,
+          sent: messageIDs.length > 0,
           authorized: true,
           channel: channelId,
-          messageID: body?.id || null,
+          messageID: messageIDs[0] || null,
+          // Every id, so a caller can see the split rather than guessing from a count.
+          messageIDs,
+          chunks: chunks.length,
+          deliveredChunks: messageIDs.length,
           // Discord returns 200; a message id is the only proof it existed.
-          delivered: Boolean(body?.id),
+          delivered: messageIDs.length === chunks.length && messageIDs.length > 0,
           // What this message answers, so the session thread reads as a conversation
           // instead of an agent talking to itself. Inbound DiscordFrame rows are
           // agentOnly and hidden by design; the reply carries the other half.
@@ -860,7 +948,14 @@ export function setup(provide) {
         else
           reply = 'Not framed: ' + routed.reason + '.';
 
-        let updated = await updateInteractionOriginal({ applicationID, interactionToken, content: reply });
+        // channelID is required for the overflow path: an interaction has one
+        // @original message, so a long reply needs a real channel for the rest.
+        let updated = await updateInteractionOriginal({
+          applicationID,
+          interactionToken,
+          channelID: payload.channel_id || null,
+          content: reply,
+        });
         if (!updated.ok)
           console.warn('[discord] interaction follow-up failed'
             + (updated.status ? ' (HTTP ' + updated.status + ')' : '')
