@@ -43,7 +43,7 @@ class FakeSocket {
 // A PluginInterface stand-in: the plugin only subclasses it and registers a tool.
 class FakePluginInterface {}
 
-function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allowed = true } = {}) {
+function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allowed = true, enabled = undefined } = {}) {
   let captured = { mounts: [], migrations: [], tools: [], classes: [], frames: [], queries: [], authorizations: [] };
 
   let db = () => ({
@@ -91,6 +91,7 @@ function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allo
     readConfig: async (path) => {
       if (path === '/kikx/discord/bot/token') return token;
       if (path === '/kikx/discord/public/key') return null;
+      if (path === '/kikx/discord/gateway/enabled') return enabled;
       return null;
     },
   };
@@ -127,8 +128,52 @@ test('the plugin still registers its tool and migrations', () => {
   // way to write a grant the strict gate could only be satisfied by hand-written SQL.
   // policy_revoke is the mirror: without it a grant could only be taken away by
   // someone with database access, which is not a security posture, it is a workaround.
-  assert.deepEqual(captured.tools, ['discord:send', 'discord:policy_grant', 'discord:policy_revoke']);
+  // The full tool list must come out of setup(). This assertion is the reason
+  // discord-tools.mjs cannot rot as a module nobody enters.
+  assert.deepEqual(captured.tools, [
+    'discord:send',
+    'discord:policy_grant',
+    'discord:policy_revoke',
+    'discord:list_servers',
+    'discord:list_channels',
+    'discord:list_threads',
+    'discord:list_messages',
+    'discord:participants',
+    'discord:react',
+    'discord:post_file',
+  ]);
   assert.equal(captured.migrations.length, 1);
+});
+
+test('onInit refuses to dial when the gateway off-switch is off, even WITH a token', async () => {
+  let { plugin } = buildPlugin({ token: 'bot-token-123', enabled: false });
+  let warnings = [];
+  let log = console.warn;
+  console.warn = (message) => warnings.push(String(message));
+  try {
+    await withFakeNetwork(async () => {
+      await plugin.onInit();
+      assert.equal(FakeSocket.instances.length, 0, 'an off-switch must beat a present token - a second IDENTIFY would evict the live gateway');
+    });
+  } finally {
+    console.warn = log;
+  }
+  assert.ok(
+    warnings.some((w) => /gateway disabled by config/.test(w)),
+    'expected an honest disabled-refusal, got ' + JSON.stringify(warnings),
+  );
+});
+
+test('onInit still dials when the off-switch is absent or truthy (old behaviour byte-for-byte)', async () => {
+  for (let enabledValue of [undefined, null, true, 'true']) {
+    let { plugin } = buildPlugin({ token: 'bot-token-123', enabled: enabledValue });
+    await withFakeNetwork(async () => {
+      FakeSocket.instances = [];
+      await plugin.onInit();
+      assert.ok(FakeSocket.instances.length >= 1, 'enabled=' + String(enabledValue) + ' must still dial');
+      FakeSocket.instances = [];
+    });
+  }
 });
 
 test('onInit refuses honestly and dials nothing when there is no bot token', async () => {

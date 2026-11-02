@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { DiscordGateway, DEFAULT_INTENTS } from './gateway.mjs';
 import { DiscordInboundRouter } from './inbound-router.mjs';
 import { DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from './message-split.mjs';
+import { registerDiscordTools } from './discord-tools.mjs';
 
 export const pluginName = 'discord';
 
@@ -56,6 +57,9 @@ export function setup(provide) {
     // The bot token lives under one config path; naming it once keeps the gateway, the
     // send tool and the interaction follow-up from drifting to different keys.
     const KIKX_DISCORD_BOT_TOKEN_PATH = '/kikx/discord/bot/token';
+    // The gateway off-switch. Named once so gatewayLoop and any status/health
+    // surface agree on the same key. Env form: KIKX_DISCORD_GATEWAY_ENABLED.
+    const GATEWAY_ENABLED_PATH = '/kikx/discord/gateway/enabled';
 
     // Ed25519 verification of X-Signature-Ed25519 over timestamp+body.
     function verifySignature({ publicKey, signature, timestamp, rawBody, now = Date.now() }) {
@@ -237,6 +241,7 @@ export function setup(provide) {
           actor: { type: 'string', description: 'Who is sending' },
           channel: { type: 'string', description: 'Channel the grant must cover' },
           content: { type: 'string' },
+          replyToMessageID: { type: 'string', description: 'Optional: make this a TRUE reply to that message id' },
         },
       };
 
@@ -280,7 +285,7 @@ export function setup(provide) {
 
         let messageIDs = [];
         let firstResponse = null;
-        for (let chunk of chunks) {
+        for (let [chunkIndex, chunk] of chunks.entries()) {
           let res;
           try {
             res = await fetch(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
@@ -290,7 +295,15 @@ export function setup(provide) {
                 'Content-Type': 'application/json',
                 'User-Agent': 'Kikx-Discord (https://github.com/th317erd/kikx, 0.1.0)',
               },
-              body: JSON.stringify({ content: chunk }),
+              body: JSON.stringify({
+                content: chunk,
+                // A TRUE Discord reply. Only the FIRST chunk carries the
+                // reference: a split reply that quoted the parent on every part
+                // would draw the same reply quote above each message.
+                ...(chunkIndex === 0 && params.replyToMessageID
+                  ? { message_reference: { message_id: String(params.replyToMessageID), fail_if_not_exists: false } }
+                  : {}),
+              }),
             });
           } catch (error) {
             return {
@@ -344,6 +357,8 @@ export function setup(provide) {
           // What this message answers, so the session thread reads as a conversation
           // instead of an agent talking to itself. Inbound DiscordFrame rows are
           // agentOnly and hidden by design; the reply carries the other half.
+          // The explicit parent id, when the caller asked for a true reply.
+          ...(params.replyToMessageID ? { replyToMessageID: String(params.replyToMessageID) } : {}),
           ...replyToField,
         };
       }
@@ -359,7 +374,7 @@ export function setup(provide) {
     // to actors in the discord: namespace. A general capability-granting tool living
     // inside a transport plugin would be a backdoor, so this one cannot grant authority
     // it could not itself use.
-    const GRANTABLE_ACTIONS = new Set(['discord.inbound', 'discord.send']);
+    const GRANTABLE_ACTIONS = new Set(['discord.inbound', 'discord.send', 'discord.read', 'discord.react']);
 
     class PolicyGrantTool extends PluginInterface {
       static pluginID = 'discord';
@@ -499,6 +514,13 @@ export function setup(provide) {
 
     registry.registerTool('discord:policy_revoke', PolicyRevokeTool);
 
+    // Read + reaction + file tools (7 more, 10 registered in total). Registered
+    // HERE, from the entry point: a correct module nothing enters is the defect
+    // shape this plugin keeps producing, so spec/plugin-entry-spec.mjs asserts
+    // the full tool list comes out of this exact call path, not merely out of
+    // discord-tools.mjs's own spec.
+    registerDiscordTools({ registry, PluginInterface, authorize, readConfig, tokenPath: KIKX_DISCORD_BOT_TOKEN_PATH });
+
     // --- gateway -------------------------------------------------------------
     // Interactions arrive over HTTP, but ordinary channel messages only arrive over the
     // gateway websocket. Without it, a Discord channel is a one-way transport: replies
@@ -522,6 +544,8 @@ export function setup(provide) {
     let observed = {
       startedAt: Date.now(),
       tokenPresent: false,
+      // null until gatewayLoop evaluates the off-switch; then true/false.
+      gatewayEnabled: null,
       lastDispatchAt: null,
       lastDispatchType: null,
       recentOutcomes: [],
@@ -548,6 +572,7 @@ export function setup(provide) {
       let status = typeof gateway?.status === 'function' ? gateway.status() : null;
       return {
         tokenPresent: observed.tokenPresent,
+        gatewayEnabled: observed.gatewayEnabled,
         connected: status?.ready === true,
         gateway: status,
         startedAt: new Date(observed.startedAt).toISOString(),
@@ -835,6 +860,23 @@ export function setup(provide) {
 
       await refreshInboundConfig();
       observed.tokenPresent = true;
+
+      // Explicit off-switch, checked AFTER the token, deliberately. A token is not
+      // enough to justify a socket: this instance may be the REST-only twin of a
+      // live gateway on another server (3003's test rig beside 3098's real gateway),
+      // and a second IDENTIFY on the same bot token evicts the first session -
+      // Discord's "session invalidated" storm. Ordering it after the token check
+      // makes the disabled log line PROOF that a token was present (a token-less
+      // instance still says "no bot token configured" instead). Absent or truthy =
+      // enabled, so every existing deployment keeps its behaviour byte-for-byte;
+      // only an explicit false/0/"false" silences THIS gateway.
+      let enabledRaw = await readConfig(GATEWAY_ENABLED_PATH, null);
+      let enabled = !(enabledRaw === false || enabledRaw === 0 || String(enabledRaw).toLowerCase() === 'false');
+      observed.gatewayEnabled = enabled;
+      if (!enabled) {
+        console.warn('[discord] gateway not started: gateway disabled by config (REST-only mode; /kikx/discord/gateway/enabled is off)');
+        return;
+      }
 
       gateway = new DiscordGateway({
         token,
