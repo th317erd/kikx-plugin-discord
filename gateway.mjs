@@ -192,6 +192,18 @@ export class DiscordGateway {
       });
     });
     socket.addEventListener('close', (event) => {
+      // IDENTITY CHECK, deliberately not a flag. A close from a socket that is no
+      // longer `this.socket` is a LATE event: its replacement is already live, and
+      // acting on it would schedule a reconnect that tears down the healthy socket
+      // -- one error becomes a storm. It is also what made an operator reconnect
+      // cost two backoff steps: closeAndReconnect() nulls this.socket and closes the
+      // old socket, so by the time this listener ran the socket was already
+      // superseded, and the unconditional schedule below doubled the operator's own
+      // single scheduleReconnect() call. Measured on live 3003: attempt 23, delay
+      // pinned at the 30s cap, 81 reconnects against 19 READYs.
+      if (socket !== this.socket)
+        return;
+
       this.ready = false;
       this.clearHeartbeat();
       this.socket = null;
@@ -379,12 +391,22 @@ export class DiscordGateway {
   closeAndReconnect() {
     let socket = this.socket;
     this.clearHeartbeat();
-    this.socket = null;
     this.ready = false;
+
+    // Detach the socket BEFORE closing it, so the close listener sees a superseded
+    // socket and returns. The listener is now the single owner of the
+    // reconnect-on-close path.
+    this.socket = null;
+
+    // The close listener owns the reconnect for a real socket, but a fake or
+    // already-closed one may never fire `close`, so this is still scheduled
+    // directly. That is safe now: scheduleReconnect clears a pending timer AND
+    // this path no longer races a second call from the listener, so `attempt`
+    // advances exactly once per reconnect instead of twice. The previous comment
+    // here claimed the double schedule "collapses into one" -- it collapsed the
+    // TIMER, which is why the doubling was invisible in the log except as a
+    // backoff that climbed twice as fast as it should.
     try { socket?.close(4000, 'reconnect'); } catch (_e) { /* already gone */ }
-    // The close listener schedules the reconnect, but a fake or already-closed socket
-    // may never fire it, so this is scheduled directly too. scheduleReconnect clears
-    // any pending timer first, so a double schedule collapses into one.
     this.scheduleReconnect();
   }
 
