@@ -58,6 +58,9 @@ export class DiscordInboundRouter {
     // it: two live gateway instances both answering MESSAGE_CREATE is exactly how one
     // channel message became two frames on 3003.
     this.claimMessage = options.claimMessage || null;
+    // Optional. Counterpart of claimMessage: drops a claim whose frame was never
+    // written, so a failed append does not poison the message id forever.
+    this.releaseClaim = options.releaseClaim || null;
     // The edit path updates the frame a message already became, so the mapping row
     // has to be readable and writable from here rather than from the caller.
     this.findFrame = options.findFrame || (async () => null);
@@ -300,27 +303,54 @@ export class DiscordInboundRouter {
       if (won === false) return { handled: false, reason: 'duplicate' };
     }
 
-    let frame = await this.appendFrame(sessionID, {
-      text,
-      source: 'discord',
-      // The frame is not the owner speaking. Without the author fields it is
-      // presented as the owner's own message, which is both wrong and
-      // untraceable; core attributes the turn from these
-      // (FrameTypeUserMessage.getAuthorDisplayName).
-      type: DISCORD_FRAME_TYPE,
-      authorID: `discord:${authorID}`,
-      // The bare Discord handle, with no " (Discord)" suffix. The type says where
-      // the message came from; decorating the display name made the owner's own
-      // name look like a different person and was the wrong fix for the wrong
-      // mechanism.
-      authorDisplayName: authorName,
-      // The message id travels with the frame so an edit can find it again, and so a
-      // reconnect replay can be recognised as the same frame rather than a new one.
-      content: { discord: { messageID, channelID, authorName, authorID } },
-    });
+    // The claim was taken a few statements ago and nothing has filled it yet. If
+    // appendFrame fails, leaving that claim in place means every redelivery reads it
+    // as an already-claimed duplicate and the message is lost permanently: a stranded
+    // row with frame_id NULL that nothing can ever reach again.
+    //
+    // Releasing it here is safe in a way that a general "reclaim any NULL frame_id
+    // row" rule is not. This path wrote no frame, so a second delivery cannot
+    // duplicate one. A *concurrent* handler's claim-to-write window also has frame_id
+    // NULL, which is why the SQL reclaim rule additionally refuses any message id that
+    // already has a frame row.
+    let frame;
+    try {
+      frame = await this.appendFrame(sessionID, {
+        text,
+        source: 'discord',
+        // The frame is not the owner speaking. Without the author fields it is
+        // presented as the owner's own message, which is both wrong and
+        // untraceable; core attributes the turn from these
+        // (FrameTypeUserMessage.getAuthorDisplayName).
+        type: DISCORD_FRAME_TYPE,
+        authorID: `discord:${authorID}`,
+        // The bare Discord handle, with no " (Discord)" suffix. The type says where
+        // the message came from; decorating the display name made the owner's own
+        // name look like a different person and was the wrong fix for the wrong
+        // mechanism.
+        authorDisplayName: authorName,
+        // The message id travels with the frame so an edit can find it again, and so a
+        // reconnect replay can be recognised as the same frame rather than a new one.
+        content: { discord: { messageID, channelID, authorName, authorID } },
+      });
+    } catch (error) {
+      // Nothing was written, so the claim is not protecting a frame: it can go.
+      try {
+        if (typeof this.releaseClaim === 'function')
+          await this.releaseClaim({ messageID });
+      } catch (releaseError) {
+        this.log('warn',
+          'discord: could not release the claim for ' + messageID + ': ' + releaseError.message);
+      }
+      throw error;
+    }
 
     // appendFrame returns { session, frame, commit, wakePending }: the frame id is one
     // level down. Reading frame.id directly silently records no mapping at all.
+    //
+    // Deliberately NOT released when recordFrame fails: that can only happen once a
+    // frame exists, and releasing the claim then would invite a second frame for the
+    // same message. An unfilled claim beside a real frame is the lesser harm.
     let frameID = frame?.frame?.id || frame?.id || null;
     await this.recordFrame({ messageID, sessionID, frameID, text });
     return { handled: true, sessionID, frameID, messageID };

@@ -413,6 +413,11 @@ export function setup(provide) {
 
     // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
     // a database, or a session runtime. Every effect it needs is bound here.
+    // How long a claim may sit unfilled before a redelivery is allowed to take it
+    // over. Discord redelivers promptly, so this only has to exceed one handler's
+    // claim-to-write gap (milliseconds) without making a lost message wait forever.
+    const CLAIM_GRACE_SECONDS = 120;
+
     let inbound = new DiscordInboundRouter({
       findChannelSession: (channelID) => db().one(
         'SELECT session_id FROM discord_channel_session WHERE channel_id = $1',
@@ -441,20 +446,60 @@ export function setup(provide) {
       // gateways cannot both frame the same Discord message. seenMessage() alone was a
       // read followed much later by a write, and on 3003 that gap produced frames 4+5
       // and 7+8 from single messages.
+      // A claim that is abandoned must be releasable, or the message id is poisoned:
+      // claimMessage() answers 'duplicate' forever and recordFrame()'s own self-heal
+      // (WHERE frame_id IS NULL) becomes unreachable by construction.
+      //
+      // Only rows with no frame behind them are deleted. Once a frame exists the
+      // mapping may be incomplete, but re-framing would duplicate the message, which
+      // is strictly worse than a missing mapping row.
+      releaseClaim: ({ messageID }) => db().query(
+        'DELETE FROM discord_message_frame WHERE message_id = $1 AND frame_id IS NULL',
+        [messageID],
+      ),
       claimMessage: async ({ messageID }) => {
+        // One statement, so there is no window between deciding and claiming.
+        //
+        // DO NOTHING was the original rule, and it had a failure mode: a handler that
+        // died between the claim and the frame write left a row with frame_id NULL
+        // that nothing could reach again. Every redelivery read it as an already-
+        // claimed duplicate, so the message was lost permanently and silently, and
+        // recordFrame()'s own self-heal (WHERE frame_id IS NULL) was unreachable.
+        //
+        // DO UPDATE takes such a row over, but only when it is provably abandoned:
+        //   * frame_id IS NULL      - no frame was ever written for it, and
+        //   * older than the grace window - so a handler that is merely between
+        //     claim and write is not robbed of its own claim.
+        //
+        // That second condition is what keeps this from reopening the duplicate-frame
+        // race the claim was introduced to close. A concurrent handler's claim-to-
+        // write window also has frame_id NULL, so "unfilled" alone is not evidence of
+        // abandonment. A row that already has a frame is never taken over: the mapping
+        // may be incomplete, but re-framing would duplicate the message.
+        //
+        // created_at is reset on takeover so a claim that keeps being abandoned cannot
+        // be stolen in a tight loop by successive redeliveries.
         let row = await db().one(
           `INSERT INTO discord_message_frame (message_id, session_id, frame_id, original_text)
            VALUES ($1,'',NULL,'')
-           ON CONFLICT (message_id) DO NOTHING
+           ON CONFLICT (message_id) DO UPDATE
+             SET session_id = EXCLUDED.session_id,
+                 created_at = now()
+             WHERE discord_message_frame.frame_id IS NULL
+               AND discord_message_frame.created_at
+                 < now() - ($2::int * interval '1 second')
            RETURNING message_id`,
-          [messageID],
+          [messageID, CLAIM_GRACE_SECONDS],
         );
         if (row) return true;
-        // No row came back. That means the message id already existed - but a driver or
-        // a test double that reports "no rows" without distinguishing "conflicted" from
-        // "inserted, nothing returned" would be read as a race we lost, and we would drop
-        // every inbound message. Dropping a message we could have framed is far worse
-        // than framing one twice, so confirm before deciding: only a row we can actually
+
+
+        // No row came back: the message id already existed and was not reclaimable
+        // (either a live claim, or a frame already exists). A driver or test double
+        // that reports "no rows" without distinguishing "conflicted" from "inserted,
+        // nothing returned" would be read as a race we lost, and we would drop every
+        // inbound message. Dropping a message we could have framed is far worse than
+        // framing one twice, so confirm before deciding: only a row we can actually
         // see counts as already-claimed.
         let existing = await db().one(
           'SELECT 1 AS present FROM discord_message_frame WHERE message_id = $1',
