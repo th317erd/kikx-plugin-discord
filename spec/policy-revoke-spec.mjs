@@ -51,6 +51,9 @@ function buildHarness({ grants = [] } = {}) {
       getClass: () => class { },
       registerTool: (name, cls) => captured.tools.push({ name, cls }),
       registerClass: () => {},
+      // The real loader exposes this (plugin-loader.mjs); the plugin registers its
+      // inbound DiscordFrame renderer through it.
+      registerFrameComponent: () => {},
     },
     mountHttp: () => { },
     registerMigrations: () => { },

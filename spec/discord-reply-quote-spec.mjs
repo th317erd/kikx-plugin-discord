@@ -92,6 +92,9 @@ function fakeRegistry() {
     getFrameComponents: () => new Map(),
     getToolComponents: () => new Map(),
     registerClass() {},
+    // The real loader exposes this (plugin-loader.mjs); the plugin registers its
+    // inbound DiscordFrame renderer through it.
+    registerFrameComponent() {},
     getClass: (name) => (name === 'PluginInterface'
       ? PluginInterface
       : name === 'FrameTypeUserMessage'

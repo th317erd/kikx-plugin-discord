@@ -69,6 +69,13 @@ function fakeRegistry() {
     getFrameComponents: () => new Map(frameComponents),
     getToolComponents: () => new Map(toolComponents),
     registerClass(name, Class) { classes.set(name, Class); return Class; },
+    // The real loader exposes this (plugin-loader.mjs). The plugin registers its
+    // INBOUND DiscordFrame renderer through it, so the fake must accept the call.
+    registerFrameComponent(frameType, descriptor = {}) {
+      let normalized = { ...descriptor, kind: 'frame', frameType };
+      frameComponents.set(frameType, normalized);
+      return normalized;
+    },
     getClass: (name) => classes.get(name) || null,
     registerAgentProvider() {},
   };
@@ -113,7 +120,15 @@ test('the send tool produces a FRAME component, not just a tool component', () =
   // This is the assertion that fails if `frameType` or `clientComponent` is
   // dropped from the tool: both registries stay empty and nothing errors.
   let frameComponents = registry.getFrameComponents();
-  assert.equal(frameComponents.size, 1, 'exactly one frame component must be registered');
+  // Two frame components exist now: this tool's, and the INBOUND DiscordFrame
+  // renderer registered by setup(). The claim worth asserting is that the SEND
+  // tool contributes one -- counting all of them would just re-break whenever
+  // the plugin registers another frame type.
+  assert.deepEqual(
+    [ ...frameComponents.keys() ].sort(),
+    [ 'DiscordFrame', 'DiscordSendToolFrame' ],
+    'the send tool must contribute a frame component, and the inbound renderer must be present',
+  );
 
   let descriptor = frameComponents.get('DiscordSendToolFrame');
   assert.ok(descriptor, 'the component must be keyed on DiscordSendToolFrame');

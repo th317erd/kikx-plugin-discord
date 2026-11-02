@@ -55,7 +55,7 @@ function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
   });
 
   let context = {
-    registry: { getClass: () => FakePluginInterface, registerTool: () => {}, registerClass: () => {} },
+    registry: { getClass: () => FakePluginInterface, registerTool: () => {}, registerClass: () => {}, registerFrameComponent: () => {} },
     registerMigrations: () => {},
     mountHttp: (handler, options) => {
       state.handler = handler;

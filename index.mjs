@@ -27,6 +27,20 @@ export const pluginName = 'discord';
 const SEND_CARD_TAG = 'kikx-discord-send-card';
 const SEND_CARD_URL = '/api/plugins/discord/client/discord-send-card.mjs';
 const SEND_CARD_FILE = fileURLToPath(new URL('./client/discord-send-card.mjs', import.meta.url));
+// The INBOUND half. The type class below makes an inbound message a real
+// DiscordFrame server-side; this is what makes it legible client-side. Without
+// it the frame had no registered renderer at all and an operator saw a bare
+// "Message" chip with no author and no body.
+const MESSAGE_CARD_TAG = 'kikx-discord-message-card';
+const MESSAGE_CARD_URL = '/api/plugins/discord/client/discord-message-card.mjs';
+const MESSAGE_CARD_FILE = fileURLToPath(new URL('./client/discord-message-card.mjs', import.meta.url));
+
+// subPath -> file on disk. The mount is public because a browser imports these
+// with no Kikx session attached; it serves exactly these files and nothing else.
+const CLIENT_MODULES = new Map([
+  ['/client/discord-send-card.mjs', SEND_CARD_FILE],
+  ['/client/discord-message-card.mjs', MESSAGE_CARD_FILE],
+]);
 
 export function setup(provide) {
   return provide(({ context, registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig }) => {
@@ -574,6 +588,28 @@ export function setup(provide) {
 
     registry.registerClass('FrameTypeDiscordFrame', FrameTypeDiscordFrame);
 
+    // Server class alone is not enough. Registering it makes the frame typed,
+    // agentOnly and attributed - but 'client-components' then advertised ZERO
+    // renderers for 'DiscordFrame' (measured on the live instance: 123
+    // descriptors, 2 of them Discord, both for the outbound tool frame), so the
+    // frame fell through core's generic path and rendered as an anonymous
+    // "Message" chip. A transport that can write a frame type has to be able to
+    // say what it looks like.
+    //
+    // registerFrameComponent rather than registerComponent('frame', ...): the
+    // kind is not an enumeration here, it is a dispatch, and this is the
+    // registrar that owns the frame map.
+    registry.registerFrameComponent('DiscordFrame', {
+      tagName: MESSAGE_CARD_TAG,
+      moduleURL: MESSAGE_CARD_URL,
+      // Read by core's compact-header path to label a collapsed frame. Falls
+      // back to the generic type name when a plugin does not declare one, so
+      // declaring it is the difference between "Discord Message" and
+      // "DiscordFrame".
+      label: 'Discord Message',
+      icon: 'chat',
+    });
+
     // Routing policy lives in inbound-router.mjs so it can be tested without a socket,
     // a database, or a session runtime. Every effect it needs is bound here.
     // How long a claim may sit unfilled before a redelivery is allowed to take it
@@ -851,9 +887,14 @@ export function setup(provide) {
       // cannot be identity-gated: a 401 here would leave DiscordSendToolFrame
       // with no renderer and the card would fall back to a generic tool frame.
       // It serves one static file this plugin already ships, and nothing else.
-      if (request.method === 'GET' && subPath === '/client/discord-send-card.mjs') {
+      // Both renderer modules, from one table: the outbound send card and the
+      // inbound message card. A new card added to CLIENT_MODULES is served here
+      // with no further edit, which is what keeps "register a renderer" and
+      // "the browser can fetch it" from drifting apart.
+      let clientModule = CLIENT_MODULES.get(subPath);
+      if (request.method === 'GET' && clientModule) {
         let body;
-        try { body = await readFile(SEND_CARD_FILE); }
+        try { body = await readFile(clientModule); }
         catch (error) {
           response.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
           response.end(JSON.stringify({ error: { message: 'discord client module not found' } }));

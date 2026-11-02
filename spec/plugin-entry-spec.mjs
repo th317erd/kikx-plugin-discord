@@ -63,6 +63,9 @@ function buildPlugin({ token = null, binding = { session_id: 'session-1' }, allo
       // The real registry carries the class registry; the plugin registers its own
       // frame type through it, so the double has to expose the same capability.
       registerClass: (key, ClassRef) => captured.classes.push({ key, ClassRef }),
+      // The real loader exposes this (plugin-loader.mjs); the plugin registers its
+      // inbound DiscordFrame renderer through it.
+      registerFrameComponent: () => {},
     },
     registerMigrations: (options) => captured.migrations.push(options),
     mountHttp: (handler, options) => {

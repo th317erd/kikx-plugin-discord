@@ -72,6 +72,9 @@ function buildPlugin() {
       getClass: () => FakePluginInterface,
       registerTool: (name) => captured.tools.push(name),
       registerClass: (key, ClassRef) => captured.classes.push({ key, ClassRef }),
+      // The real loader exposes this (plugin-loader.mjs); the plugin registers its
+      // inbound DiscordFrame renderer through it.
+      registerFrameComponent: () => {},
     },
     registerMigrations: (options) => captured.migrations.push(options),
     mountHttp: (handler, options) => {

@@ -50,7 +50,7 @@ function buildPlugin({ binding = { session_id: 'session-1' }, seen = new Set(), 
   });
 
   let context = {
-    registry: { getClass: () => FakePluginInterface, registerTool: () => {}, registerClass: () => {} },
+    registry: { getClass: () => FakePluginInterface, registerTool: () => {}, registerClass: () => {}, registerFrameComponent: () => {} },
     registerMigrations: () => {},
     mountHttp: (handler, options) => {
       captured.handler = handler;
