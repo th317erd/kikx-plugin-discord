@@ -85,8 +85,27 @@ export function describeDiscordSend(frame) {
     outcome = 'pending';
   }
 
+  // The message this reply answers. Inbound Discord messages are framed as
+  // agentOnly and are deliberately absent from the thread, so without this the
+  // reader sees replies to nothing. Absent or unreadable means "no quote", never a
+  // placeholder: a card that invented a quotation would be worse than a bare one.
+  let replyTo = null;
+  let inbound = result?.replyTo;
+  if (inbound && typeof inbound === 'object') {
+    let quoted = typeof inbound.text === 'string' ? inbound.text.trim() : '';
+    if (quoted !== '')
+      replyTo = {
+        author: typeof inbound.author === 'string' && inbound.author.trim() !== ''
+          ? inbound.author.trim()
+          : 'Discord',
+        text: quoted,
+        messageID: typeof inbound.messageID === 'string' ? inbound.messageID : '',
+      };
+  }
+
   return {
     outcome,
+    replyTo,
     recipient: who,
     actor: typeof input.actor === 'string' ? input.actor : '',
     channel,
@@ -177,6 +196,18 @@ export class DiscordSendCard extends ElementBase {
     if (description.channelKnown)
       head.appendChild(el(doc, 'span', 'kikx-discord-send__channel', `#${description.channel}`));
     root.appendChild(head);
+
+    // Reads top-down as the conversation did: what they said, then what we sent.
+    if (description.replyTo) {
+      let reply = el(doc, 'div', 'kikx-discord-send__inbound');
+      reply.appendChild(
+        el(doc, 'span', 'kikx-discord-send__inbound-who', `replying to ${description.replyTo.author}`),
+      );
+      let quote = el(doc, 'blockquote', 'kikx-discord-send__inbound-text');
+      quote.appendChild(el(doc, 'p', null, description.replyTo.text));
+      reply.appendChild(quote);
+      root.appendChild(reply);
+    }
 
     // The quoted body is the point: the thread now shows WHAT was said to
     // Discord, and to whom, in the place where the reader is already looking.

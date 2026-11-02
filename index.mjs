@@ -110,6 +110,57 @@ export function setup(provide) {
       }
     }
 
+    // Which inbound Discord message this send is answering.
+    //
+    // The transport already owns the mapping table: discord_message_frame holds the
+    // session, the message id the message arrived as, and the exact text the agent was
+    // shown ('[discord:<name>] <body>'). Quoting from it means the reply card can show
+    // the conversation without depending on a core frame-read API a plugin may not
+    // assume, and without inventing a message that was never sent. If the lookup finds
+    // nothing, the card simply renders as it did before.
+    //
+    // Best effort on purpose: a transcript read must never fail or delay a send. The
+    // send is what the caller asked for; the quote is documentation of it.
+    async function findReplyTarget(sessionID) {
+      if (typeof sessionID !== 'string' || sessionID === '')
+        return null;
+
+      let row = null;
+      try {
+        row = await db().one(
+          `SELECT message_id, created_at, original_text
+             FROM discord_message_frame
+            WHERE session_id = $1
+              AND frame_id IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1`,
+          [sessionID],
+        );
+      } catch (error) {
+        console.warn('[discord] could not look up the message being answered: ' + String(error?.message || error));
+        return null;
+      }
+
+      if (!row || typeof row.original_text !== 'string')
+        return null;
+
+      // original_text is the framed text, prefix included. Strip our own annotation so
+      // the card quotes what the person wrote rather than how we labelled them.
+      let match = /^\[discord:([^\]]*)\] ?/.exec(row.original_text);
+      let author = match ? match[1] : '';
+      let text = match ? row.original_text.slice(match[0].length) : row.original_text;
+
+      if (text === '')
+        return null;
+
+      return {
+        messageID: typeof row.message_id === 'string' ? row.message_id : String(row.message_id ?? ''),
+        author,
+        text,
+        at: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at ?? ''),
+      };
+    }
+
     class SendTool extends PluginInterface {
       static pluginID = 'discord';
       static featureName = 'send';
@@ -154,6 +205,12 @@ export function setup(provide) {
         }
 
         let channelId = String(params.channel).replace(/^#/, '');
+
+        // Computed here rather than passed in by the caller: the agent knows what it
+        // wants to say, not which frame woke it. Core injects _sessionID into every
+        // tool call (enrichToolInput), so the transport can answer that itself.
+        let replyTo = await findReplyTarget(params._sessionID);
+        let replyToField = replyTo ? { replyTo } : {};
         let res;
         try {
           res = await fetch(`https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/messages`, {
@@ -166,12 +223,12 @@ export function setup(provide) {
             body: JSON.stringify({ content: String(params.content).slice(0, 2000) }),
           });
         } catch (error) {
-          return { sent: false, authorized: true, error: String(error?.message || error) };
+          return { sent: false, authorized: true, error: String(error?.message || error), ...replyToField };
         }
 
         if (!res.ok) {
           let detail = await res.text().catch(() => '');
-          return { sent: false, authorized: true, status: res.status, error: detail.slice(0, 300) };
+          return { sent: false, authorized: true, status: res.status, error: detail.slice(0, 300), ...replyToField };
         }
 
         let body = await res.json().catch(() => null);
@@ -182,6 +239,10 @@ export function setup(provide) {
           messageID: body?.id || null,
           // Discord returns 200; a message id is the only proof it existed.
           delivered: Boolean(body?.id),
+          // What this message answers, so the session thread reads as a conversation
+          // instead of an agent talking to itself. Inbound DiscordFrame rows are
+          // agentOnly and hidden by design; the reply carries the other half.
+          ...replyToField,
         };
       }
     }
