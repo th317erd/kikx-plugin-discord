@@ -896,6 +896,42 @@ export function setup(provide) {
     }
 
     mountHttp(async ({ request, response, rawBody, json, subPath, context, identity }) => {
+      // --- health ----------------------------------------------------------------
+      // Anonymous, deliberately. The deploy gate (kikx-docker/deploy.sh) and any
+      // uptime monitor must read this without a Kikx session, and unlike /status it
+      // exposes no dispatch history, no outcomes, no authorizations - only the
+      // failure surface of the transport, nothing about who spoke in it. The token
+      // never appears in the body. A token-less or disabled gateway answers with
+      // ok:true but its state NAMED: /health says "the route is served", the state
+      // says whether the transport can deliver, and deploy.sh asserts the state
+      // separately so a healthy Kikx with a dead Discord fails the deploy instead
+      // of reporting full success (3098 ran 5h token-less with one buried log line).
+      if (request.method === 'GET' && subPath === '/health') {
+        let snap = gatewaySnapshot();
+        let state = 'down';
+        if (snap.connected === true) state = 'ready';
+        else if (!snap.tokenPresent) state = 'no-token';
+        else if (snap.gatewayEnabled === false) state = 'disabled';
+        else if (snap.gateway) state = 'connecting';
+
+        response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        response.end(JSON.stringify({
+          ok: true,
+          gatewayState: state,
+          tokenPresent: snap.tokenPresent,
+          gatewayEnabled: snap.gatewayEnabled,
+          connected: snap.connected,
+          botUserId: snap.gateway?.userId ?? null,
+          inboundChannelID: snap.inboundChannelID,
+          inboundSessionID: snap.inboundSessionID,
+          startedAt: snap.startedAt,
+          lastDispatchAt: snap.lastDispatchAt,
+          lastError: snap.gateway?.fatal ?? null,
+          at: new Date().toISOString(),
+        }));
+        return;
+      }
+
       // --- status --------------------------------------------------------------
       // The mount is public because Discord cannot hold a Kikx session; that must not
       // make the status readable anonymously, so identity is resolved here. Core only
