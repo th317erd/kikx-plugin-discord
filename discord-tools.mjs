@@ -143,7 +143,7 @@ function mapChannel(channel) {
 
 // The factory that gives every read tool the same spine: authorise, get token,
 // run, return {ok:...}. The only thing that varies is the actual REST call.
-function makeReadTool({ PluginInterface, authorize, readConfig, tokenPath, spec }) {
+function makeReadTool({ PluginInterface, authorize, readConfig, tokenPath, tokenForChannel, spec }) {
   class DiscordReadTool extends PluginInterface {
     static pluginID = 'discord';
     static featureName = spec.featureName;
@@ -165,9 +165,16 @@ function makeReadTool({ PluginInterface, authorize, readConfig, tokenPath, spec 
       if (!verdict.allowed)
         return { ok: false, denied: true, reason: verdict.reason };
 
-      let token = await readConfig(tokenPath, null);
+      // A channel-scoped read answers with the token THAT channel's bot holds: in a
+      // multi-bot instance, reading #squeak as the legacy bot shows the wrong
+      // identity and fails where only Squeak may read. Reads that name no channel
+      // (guild listings, list_servers) fall back to the legacy token — every fleet
+      // bot shares one guild today, so guild scope has no per-channel key.
+      let token = params.channel !== undefined && params.channel !== null && params.channel !== ''
+        ? await (tokenForChannel || (() => readConfig(tokenPath, null)))(stripHash(params.channel))
+        : await readConfig(tokenPath, null);
       if (!token)
-        return { ok: false, denied: false, authorized: true, pending: 'no-bot-token', note: 'KIKX_DISCORD_BOT_TOKEN is not configured' };
+        return { ok: false, denied: false, authorized: true, pending: 'no-bot-token', note: 'no bot token configured (per-channel /kikx/discord/bots/<key>/token or the legacy KIKX_DISCORD_BOT_TOKEN)' };
 
       return { ok: true, tool: `discord:${spec.featureName}`, ...(await spec.run(token, params)) };
     }
@@ -179,7 +186,7 @@ function makeReadTool({ PluginInterface, authorize, readConfig, tokenPath, spec 
 // registerDiscordTools is called from index.mjs setup() with the real closures
 // (registry, PluginInterface, authorize, readConfig) — that call site IS the
 // reachability proof; this function never runs in any other path.
-export function registerDiscordTools({ registry, PluginInterface, authorize, readConfig, tokenPath }) {
+export function registerDiscordTools({ registry, PluginInterface, authorize, readConfig, tokenPath, tokenForChannel }) {
   if (!PluginInterface)
     throw new Error('kikx-plugin-discord discord-tools requires PluginInterface in plugin context');
 
@@ -187,7 +194,7 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
   // GET /users/@me/guilds — the servers this bot is in. No pagination param:
   // Discord returns up to 200 with a bearer, which is the whole membership.
   registry.registerTool('discord:list_servers', makeReadTool({
-    PluginInterface, authorize, readConfig, tokenPath,
+    PluginInterface, authorize, readConfig, tokenPath, tokenForChannel,
     spec: {
       featureName: 'list_servers',
       displayName: 'Discord list servers',
@@ -212,7 +219,7 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
   // GET /guilds/{id}/channels — every channel in a server, including active
   // threads (Discord folds them into this listing).
   registry.registerTool('discord:list_channels', makeReadTool({
-    PluginInterface, authorize, readConfig, tokenPath,
+    PluginInterface, authorize, readConfig, tokenPath, tokenForChannel,
     spec: {
       featureName: 'list_channels',
       displayName: 'Discord list channels',
@@ -238,7 +245,7 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
   // GET /guilds/{id}/threads/active — ACTIVE threads only. Archived threads are
   // a different, per-channel route; not claimed here.
   registry.registerTool('discord:list_threads', makeReadTool({
-    PluginInterface, authorize, readConfig, tokenPath,
+    PluginInterface, authorize, readConfig, tokenPath, tokenForChannel,
     spec: {
       featureName: 'list_threads',
       displayName: 'Discord list threads',
@@ -266,7 +273,7 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
   // bot has: Discord offers no cross-guild search, so "search" means paging
   // this endpoint. before/after/around are Discord's own cursors.
   registry.registerTool('discord:list_messages', makeReadTool({
-    PluginInterface, authorize, readConfig, tokenPath,
+    PluginInterface, authorize, readConfig, tokenPath, tokenForChannel,
     spec: {
       featureName: 'list_messages',
       displayName: 'Discord list messages',
@@ -299,7 +306,7 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
   // needs the privileged GUILD_MEMBERS intent. Saying so beats returning an
   // empty list and letting a caller conclude the channel has no members.
   registry.registerTool('discord:participants', makeReadTool({
-    PluginInterface, authorize, readConfig, tokenPath,
+    PluginInterface, authorize, readConfig, tokenPath, tokenForChannel,
     spec: {
       featureName: 'participants',
       displayName: 'Discord participants',
@@ -358,11 +365,14 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
       if (!verdict.allowed)
         return { ok: false, denied: true, reason: verdict.reason };
 
-      let token = await readConfig(tokenPath, null);
-      if (!token)
-        return { ok: false, denied: false, authorized: true, pending: 'no-bot-token', note: 'KIKX_DISCORD_BOT_TOKEN is not configured' };
-
       let channelID = stripHash(params.channel);
+      // The reaction is placed by the bot that owns this channel, so a multi-bot
+      // instance reacts as the right identity — and a channel none of us may read
+      // fails here with its real 403 instead of the wrong bot's.
+      let token = await (tokenForChannel || (() => readConfig(tokenPath, null)))(channelID);
+      if (!token)
+        return { ok: false, denied: false, authorized: true, pending: 'no-bot-token', note: `no bot token configured for channel ${channelID}` };
+
       let messageID = String(params.message_id || '').trim();
       let emoji = String(params.emoji || '').trim();
       if (!messageID || !emoji)
@@ -420,11 +430,13 @@ export function registerDiscordTools({ registry, PluginInterface, authorize, rea
       if (!verdict.allowed)
         return { ok: false, denied: true, reason: verdict.reason };
 
-      let token = await readConfig(tokenPath, null);
-      if (!token)
-        return { ok: false, denied: false, authorized: true, pending: 'no-bot-token', note: 'KIKX_DISCORD_BOT_TOKEN is not configured' };
-
       let channelID = stripHash(params.channel);
+      // A file lands in the channel through the bot that owns the channel: same
+      // per-channel identity rule as discord:send, same honest fallback.
+      let token = await (tokenForChannel || (() => readConfig(tokenPath, null)))(channelID);
+      if (!token)
+        return { ok: false, denied: false, authorized: true, pending: 'no-bot-token', note: `no bot token configured for channel ${channelID}` };
+
       let filename = String(params.filename || '').trim();
       let base64 = String(params.bytes_base64 || '').trim();
       if (!filename || !base64)

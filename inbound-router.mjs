@@ -23,6 +23,13 @@ const FRAMEABLE_MESSAGE_TYPES = new Set([0, 19]);
 // context, so the bot never reads the message.
 const DISCORD_FRAME_TYPE = 'DiscordFrame';
 
+// The reply-hint line is prefixed with this so findReplyTarget() (index.mjs) can
+// strip it before quoting a message back to the human: the agent was shown the
+// hint, the human never was. Exported because the strip lives in another module
+// and a renamed marker on one side would leak our own instructions into the
+// conversation on the other.
+export const REPLY_HINT_MARKER = '[kikx:reply-hint]';
+
 // A newline, named rather than written as an escape inline. The diff below splits
 // message text on it, and an inline escape is exactly what got mis-quoted twice.
 const NEWLINE = String.fromCharCode(10);
@@ -109,6 +116,15 @@ export class DiscordInboundRouter {
   //     session with no participants has none, so the message is stored and then
   //     never delivered. The host owns the participant policy, so this only asks.
   //   autoBindSessionID   string | null
+  //   onBound async ({ sessionID, channelID }) => void  (optional)
+  //     Called once a channel has resolved to a session — both for an existing
+  //     binding and for a fresh auto-bind. The host uses it for per-session
+  //     bookkeeping (the typing indicator's session->channel map); failures are
+  //     logged, never fatal: bookkeeping must not cost the message.
+  //   authorizeReply async ({ channelID, actorID }) => { allowed, ... }  (optional)
+  //     The gate for discord:send, asked BEFORE the frame is written so a sendable
+  //     message can carry a reply hint the gate would actually honour. When absent
+  //     no hint is written — an unverified advertisement is worse than silence.
   constructor(options = {}) {
     this.findChannelSession = options.findChannelSession;
     this.bindChannelSession = options.bindChannelSession || (async () => {});
@@ -136,6 +152,8 @@ export class DiscordInboundRouter {
     this.authorizeInbound = options.authorizeInbound;
     this.autoBindChannelID = options.autoBindChannelID || null;
     this.autoBindSessionID = options.autoBindSessionID || null;
+    this.onBound = options.onBound || null;
+    this.authorizeReply = options.authorizeReply || null;
 
     if (typeof this.appendFrame !== 'function')
       throw new Error('DiscordInboundRouter requires appendFrame');
@@ -340,6 +358,16 @@ export class DiscordInboundRouter {
     if (!binding || !binding.session_id)
       return { handled: false, reason: 'unbound_channel', channelID };
 
+    if (typeof this.onBound === 'function') {
+      // Non-fatal, deliberately: the pair is recorded for the typing indicator, and
+      // a host that cannot record it must not lose the message over it.
+      try {
+        await this.onBound({ sessionID: binding.session_id, channelID });
+      } catch (error) {
+        this.log('warn', `discord: could not record the binding for channel ${channelID}: ${error.message}`);
+      }
+    }
+
     if (typeof this.ensureSessionRecipient === 'function') {
       // Deliberately non-fatal. A participant the host cannot supply must not cost
       // us the message; the frame is still recorded and the reason is logged.
@@ -352,6 +380,38 @@ export class DiscordInboundRouter {
 
     let sessionID = binding.session_id;
     let text = `[discord:${authorName}] ${content}`;
+
+    // The reply hint. The model sees only this frame's TEXT, and a sendable message
+    // that never says a reply is expected — nor names the channel or the tool — ends
+    // with the turn finishing inside Kikx while the human in Discord hears nothing
+    // back (two real #miri frames on 2026-11-02: a full turn, zero send calls).
+    //
+    // Computed through authorizeReply — the SAME gate discord:send itself runs, as
+    // the same Discord actor who spoke — because advertising a reply the gate would
+    // refuse turns a policy boundary into a loop of confident refusals. A failed
+    // check costs the hint, never the message.
+    // The hint is written in TWO places, deliberately: into `text`, because the
+    // model sees only the frame's text (frame-type-base toAgentMessage builds its
+    // turn from this.text and ignores content), and into content.discord.replyHint
+    // so tooling and specs can read it as data instead of parsing prose.
+    let replyHint = null;
+    if (typeof this.authorizeReply === 'function') {
+      try {
+        let verdict = await this.authorizeReply({ channelID, actorID: authorID });
+        if (verdict && verdict.allowed === true) {
+          // Both names, deliberately: the registry registers 'discord:send' but the
+          // model is shown 'discord__send' (core rewrites ':' on exposure), and a
+          // hint naming only one of them produces an agent asking for a tool nobody
+          // has — indistinguishable from having no tool at all.
+          replyHint = REPLY_HINT_MARKER
+            + ' A reply in Discord is expected: call discord_send (registered as discord:send)'
+            + ` with channel "${channelID}" to answer ${authorName} in that channel.`;
+          text += NEWLINE + replyHint;
+        }
+      } catch (error) {
+        this.log('warn', `discord: could not verify the send gate for a reply hint: ${error.message}`);
+      }
+    }
 
     // The exclusive claim, immediately before the write.
     //
@@ -399,7 +459,7 @@ export class DiscordInboundRouter {
         authorDisplayName: authorName,
         // The message id travels with the frame so an edit can find it again, and so a
         // reconnect replay can be recognised as the same frame rather than a new one.
-        content: { discord: { messageID, channelID, authorName, authorID } },
+        content: { discord: { messageID, channelID, authorName, authorID, ...(replyHint ? { replyHint } : {}) } },
       });
     } catch (error) {
       // Nothing was written, so the claim is not protecting a frame: it can go.

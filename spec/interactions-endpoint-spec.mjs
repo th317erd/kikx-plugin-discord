@@ -177,7 +177,11 @@ test('a signed MESSAGE_CREATE is framed into the bound session', async () => {
   assert.equal(result.status, 202);
   assert.equal(captured.frames.length, 1);
   assert.equal(captured.frames[0].sessionID, 'session-1');
-  assert.match(captured.frames[0].input.text, /^\[discord:wyatt\] hello over http$/);
+  // Message first, reply hint after (the hint lives in the text — all the model
+  // sees). The message line itself is unchanged.
+  let [firstLine, ...hintLines] = captured.frames[0].input.text.split('\n');
+  assert.equal(firstLine, '[discord:wyatt] hello over http');
+  assert.match(hintLines.join('\n'), /^\[kikx:reply-hint\]/);
 });
 
 test('the same message delivered twice over HTTP is framed once', async () => {

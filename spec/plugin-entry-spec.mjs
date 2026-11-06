@@ -222,7 +222,12 @@ test('an inbound MESSAGE_CREATE from an authorized user is framed into the bound
     });
     assert.equal(captured.frames.length, 1, 'the message must reach appendToSession');
     assert.equal(captured.frames[0].sessionID, 'session-1');
-    assert.match(captured.frames[0].input.text, /^\[discord:wyatt\] hello miri$/);
+    // The framed text is now message + reply hint (the hint MUST be in the text:
+    // that is all the model ever sees). The first line stays exactly the message.
+    let [firstLine, ...hintLines] = captured.frames[0].input.text.split('\n');
+    assert.equal(firstLine, '[discord:wyatt] hello miri');
+    assert.match(hintLines.join('\n'), /^\[kikx:reply-hint\]/,
+      'a sendable message must tell the agent a reply is expected');
     // And the mapping row is written so an edit can find the frame later.
     assert.ok(captured.queries.some((q) => /INSERT INTO discord_message_frame/.test(q.sql)));
 

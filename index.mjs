@@ -15,9 +15,10 @@ import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { DiscordGateway, DEFAULT_INTENTS } from './gateway.mjs';
-import { DiscordInboundRouter } from './inbound-router.mjs';
+import { DiscordInboundRouter, REPLY_HINT_MARKER } from './inbound-router.mjs';
 import { DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from './message-split.mjs';
 import { registerDiscordTools } from './discord-tools.mjs';
+import { createTypingIndicator } from './typing.mjs';
 
 export const pluginName = 'discord';
 
@@ -44,7 +45,7 @@ const CLIENT_MODULES = new Map([
 ]);
 
 export function setup(provide) {
-  return provide(({ context, registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig }) => {
+  return provide(({ context, registry, mountHttp, authorize, db, registerMigrations, appendToSession, appendFrame, appendToSessionQuietly, readConfig, subscribe }) => {
     registerMigrations({ directory: 'sql' });
     let PluginInterface = registry.getClass('PluginInterface');
     if (!PluginInterface)
@@ -60,6 +61,94 @@ export function setup(provide) {
     // The gateway off-switch. Named once so gatewayLoop and any status/health
     // surface agree on the same key. Env form: KIKX_DISCORD_GATEWAY_ENABLED.
     const GATEWAY_ENABLED_PATH = '/kikx/discord/gateway/enabled';
+
+    // --- per-channel bot identity ---------------------------------------------
+    // One instance may carry several Discord bot applications: each bound channel
+    // is answered by ONE of them, named by discord_channel_session.bot_key
+    // (sql/005-channel-bot-key.sql). 'default' means the single legacy token above,
+    // so an instance that configures no per-bot tokens behaves exactly as before.
+    //
+    // Token config paths derive mechanically from the key
+    // (/kikx/discord/bots/<key>/token), and core's envKeyFor maps that path to
+    // KIKX_DISCORD_BOTS_<KEY>_TOKEN — proved against the real core function in
+    // spec/channel-bot-token-spec.mjs, so compose only carries the derived names.
+    const KIKX_DISCORD_BOTS_TOKEN_PATH_PREFIX = '/kikx/discord/bots';
+    const LEGACY_BOT_KEY = 'default';
+
+    function botTokenPath(botKey) {
+      return `${KIKX_DISCORD_BOTS_TOKEN_PATH_PREFIX}/${botKey}/token`;
+    }
+
+    // channelID -> bot_key, sessionID -> channelID, both from the binding table.
+    // Kept in memory rather than queried per send because discord:send and the read
+    // tools run outside every HTTP route: nothing would refresh a query-time view
+    // for a tool call the agent makes minutes after the last inbound message.
+    const channelBotKey = new Map();
+    const sessionChannelID = new Map();
+
+    // Reload both maps from discord_channel_session. Called from
+    // refreshInboundConfig(), which every inbound path already runs — so a cut-over
+    // UPDATE of bot_key takes effect on the next message, without a restart.
+    async function loadChannelBindings() {
+      try {
+        let result = await db().query(
+          'SELECT channel_id, session_id, bot_key FROM discord_channel_session',
+          [],
+        );
+        for (let row of Array.isArray(result?.rows) ? result.rows : []) {
+          if (!row?.channel_id) continue;
+          channelBotKey.set(String(row.channel_id),
+            typeof row.bot_key === 'string' && row.bot_key ? row.bot_key : LEGACY_BOT_KEY);
+          if (row.session_id) sessionChannelID.set(String(row.session_id), String(row.channel_id));
+        }
+      } catch (error) {
+        // Before sql/005 has run (or with a driver that reports no rows) the maps
+        // stay empty and every channel falls back to the legacy token: the
+        // pre-multi-bot behaviour, safe by construction.
+        console.warn('[discord] could not load channel-to-bot bindings: ' + String(error?.message || error));
+      }
+    }
+
+    // Which token speaks in THIS channel: the bound bot_key's config path, falling
+    // back to the legacy token for 'default' keys, for a key whose per-bot token is
+    // not configured, and for channels no binding names yet.
+    async function tokenForChannel(channelID) {
+      let key = (channelID && channelBotKey.get(String(channelID))) || LEGACY_BOT_KEY;
+      if (key === LEGACY_BOT_KEY)
+        return await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
+      return await readConfig(botTokenPath(key), null)
+        || await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
+    }
+
+    // The typing indicator posts with the same token the channel's replies use, so
+    // "Squeak is typing..." and Squeak's answer are the same identity.
+    const typingIndicator = createTypingIndicator({
+      resolveChannel: (sessionID) => sessionChannelID.get(String(sessionID)) || null,
+      tokenForChannel,
+      log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
+    });
+
+    // Called by the router once a channel has resolved to a session (existing
+    // binding or auto-bind). Records session->channel for typing, and subscribes
+    // the indicator to THAT session's events exactly once: the plugin event bus
+    // copies the session set at subscribe time, and an unscoped subscription
+    // receives nothing at all (plugin-events.mjs #dispatch).
+    const typingSubscribedSessions = new Set();
+    async function noteSessionBound({ sessionID, channelID }) {
+      if (!sessionID || !channelID) return;
+      sessionChannelID.set(String(sessionID), String(channelID));
+      if (!channelBotKey.has(String(channelID)))
+        channelBotKey.set(String(channelID), LEGACY_BOT_KEY);
+      if (typeof subscribe !== 'function' || typingSubscribedSessions.has(String(sessionID)))
+        return;
+      typingSubscribedSessions.add(String(sessionID));
+      try {
+        await subscribe(typingIndicator.onEvent, { sessions: [String(sessionID)] });
+      } catch (error) {
+        typingSubscribedSessions.delete(String(sessionID));
+        console.warn('[discord] could not subscribe the typing indicator: ' + String(error?.message || error));
+      }
+    }
 
     // Ed25519 verification of X-Signature-Ed25519 over timestamp+body.
     function verifySignature({ publicKey, signature, timestamp, rawBody, now = Date.now() }) {
@@ -104,7 +193,9 @@ export function setup(provide) {
     // HTTP response has been sent, so a failure here has no status code left to occupy:
     // it is logged, and the placeholder is what the user is left looking at.
     async function updateInteractionOriginal({ applicationID, interactionToken, channelID, content }) {
-      let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
+      // The follow-up carries this channel's own bot identity: a slash command
+      // answered by a different application would read as two bots in one thread.
+      let token = await tokenForChannel(channelID);
       if (!token) return { ok: false, pending: 'no-bot-token' };
 
       // An interaction has exactly ONE @original message, so the first chunk edits
@@ -207,10 +298,16 @@ export function setup(provide) {
         return null;
 
       // original_text is the framed text, prefix included. Strip our own annotation so
-      // the card quotes what the person wrote rather than how we labelled them.
-      let match = /^\[discord:([^\]]*)\] ?/.exec(row.original_text);
+      // the card quotes what the person wrote rather than how we labelled them — and
+      // strip the reply hint too: the agent was shown it, the human never was, and
+      // quoting it back would put our own instructions into the conversation.
+      let quoted = String(row.original_text)
+        .split('\n')
+        .filter((line) => !line.startsWith(REPLY_HINT_MARKER))
+        .join('\n');
+      let match = /^\[discord:([^\]]*)\] ?/.exec(quoted);
       let author = match ? match[1] : '';
-      let text = match ? row.original_text.slice(match[0].length) : row.original_text;
+      let text = match ? quoted.slice(match[0].length) : quoted;
 
       if (text === '')
         return null;
@@ -254,7 +351,12 @@ export function setup(provide) {
         if (!verdict.allowed)
           return { sent: false, denied: true, reason: verdict.reason };
 
-        let token = await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
+        let channelId = String(params.channel).replace(/^#/, '');
+        // The channel decides the identity: the reply goes out as the bot this
+        // channel is bound to (bot_key on discord_channel_session), not as whichever
+        // token the process happens to hold. Channels with no bot_key fall back to
+        // the legacy token — the pre-multi-bot behaviour, byte for byte.
+        let token = await tokenForChannel(channelId);
         if (!token) {
           // Authorised but unable to deliver. Saying so is the only honest answer: a
           // "sent" that did not send is worse than a refusal.
@@ -263,11 +365,9 @@ export function setup(provide) {
             denied: false,
             authorized: true,
             pending: 'no-bot-token',
-            note: 'KIKX_DISCORD_BOT_TOKEN is not configured',
+            note: `no bot token configured for channel ${channelId} (checked /kikx/discord/bots/<key>/token and the legacy KIKX_DISCORD_BOT_TOKEN)`,
           };
         }
-
-        let channelId = String(params.channel).replace(/^#/, '');
 
         // Computed here rather than passed in by the caller: the agent knows what it
         // wants to say, not which frame woke it. Core injects _sessionID into every
@@ -339,8 +439,12 @@ export function setup(provide) {
 
           firstResponse = firstResponse || res;
           let posted = await res.json().catch(() => null);
-          if (posted?.id)
+          if (posted?.id) {
             messageIDs.push(posted.id);
+            // The answer has landed: re-arming typing after this point would show
+            // "typing..." OVER the reply that was just delivered.
+            typingIndicator.noteSent(channelId);
+          }
         }
 
         return {
@@ -519,7 +623,7 @@ export function setup(provide) {
     // shape this plugin keeps producing, so spec/plugin-entry-spec.mjs asserts
     // the full tool list comes out of this exact call path, not merely out of
     // discord-tools.mjs's own spec.
-    registerDiscordTools({ registry, PluginInterface, authorize, readConfig, tokenPath: KIKX_DISCORD_BOT_TOKEN_PATH });
+    registerDiscordTools({ registry, PluginInterface, authorize, readConfig, tokenPath: KIKX_DISCORD_BOT_TOKEN_PATH, tokenForChannel });
 
     // --- gateway -------------------------------------------------------------
     // Interactions arrive over HTTP, but ordinary channel messages only arrive over the
@@ -766,6 +870,20 @@ export function setup(provide) {
           scope: { channel: channelID },
         });
       },
+      // The router resolved a channel to a session (existing binding or
+      // auto-bind): record the pair for the typing indicator and scope its
+      // subscription to this one session. Non-fatal by the router's contract —
+      // bookkeeping this host cannot do must not cost the message.
+      onBound: (args) => noteSessionBound(args),
+      // The reply hint is computed through the SAME gate discord:send itself uses,
+      // as the same Discord actor who spoke. Advertising a reply the gate would
+      // refuse is worse than silence: it turns a policy boundary into a loop of
+      // confident refusals.
+      authorizeReply: async ({ channelID, actorID }) => authorize({
+        actor: 'discord:' + actorID,
+        action: 'discord.send',
+        scope: { channel: channelID },
+      }),
     });
 
     // Binding config is read at delivery time rather than setup time: a reload has no
@@ -774,6 +892,7 @@ export function setup(provide) {
     async function refreshInboundConfig() {
       inbound.autoBindChannelID = await readConfig('/kikx/discord/inbound/channel', null);
       inbound.autoBindSessionID = await readConfig('/kikx/discord/inbound/session', null);
+      await loadChannelBindings();
     }
 
     // Give the inbound session somebody to route to.
@@ -1161,6 +1280,9 @@ export function setup(provide) {
         // dialling Discord for a plugin that has been unloaded.
         if (gateway) gateway.stop();
         gateway = null;
+        // A re-armed typing window would otherwise keep posting to Discord for the
+        // life of the process, for a plugin that has been unloaded.
+        typingIndicator.stopAll();
       },
     };
   });
