@@ -80,39 +80,76 @@ export function setup(provide) {
     }
 
     // channelID -> bot_key, sessionID -> channelID, both from the binding table.
-    // Kept in memory rather than queried per send because discord:send and the read
-    // tools run outside every HTTP route: nothing would refresh a query-time view
-    // for a tool call the agent makes minutes after the last inbound message.
+    // The maps are a CACHE of discord_channel_session, never its replacement:
+    // tokenForChannel() guarantees a fresh load before every identity decision, so
+    // a binding row inserted or updated after startup (cut-over UPDATEs, auto-bind)
+    // is believed on the next send/react/read/typing call — with or without an
+    // inbound message or a process restart.
     const channelBotKey = new Map();
     const sessionChannelID = new Map();
 
-    // Reload both maps from discord_channel_session. Called from
-    // refreshInboundConfig(), which every inbound path already runs — so a cut-over
-    // UPDATE of bot_key takes effect on the next message, without a restart.
+    // Reload both maps from discord_channel_session. Reached from
+    // refreshInboundConfig() (both HTTP inbound paths and gatewayLoop startup)
+    // and awaited by tokenForChannel()/noteSessionBound() — the paths that must
+    // never act on a stale identity. Concurrent callers coalesce into one SELECT.
+    let bindingsLoadInFlight = null;
+    let warnedBindingsNotReady = false;
     async function loadChannelBindings() {
-      try {
-        let result = await db().query(
-          'SELECT channel_id, session_id, bot_key FROM discord_channel_session',
-          [],
-        );
-        for (let row of Array.isArray(result?.rows) ? result.rows : []) {
-          if (!row?.channel_id) continue;
-          channelBotKey.set(String(row.channel_id),
-            typeof row.bot_key === 'string' && row.bot_key ? row.bot_key : LEGACY_BOT_KEY);
-          if (row.session_id) sessionChannelID.set(String(row.session_id), String(row.channel_id));
+      if (bindingsLoadInFlight) return await bindingsLoadInFlight;
+      bindingsLoadInFlight = (async () => {
+        try {
+          // Production order on atlas (2026-11-06): onInit → gatewayLoop →
+          // refreshInboundConfig() ran while db() was still null (migrations
+          // applied AFTER it), and nothing on the gateway path ever retried — so
+          // every one of the four fleet channels resolved the legacy token. An
+          // unavailable handle is therefore the early window, not a fault: say so
+          // once, load nothing, and let the next identity decision retry.
+          let handle = db();
+          if (!handle || typeof handle.query !== 'function') {
+            if (!warnedBindingsNotReady) {
+              warnedBindingsNotReady = true;
+              console.warn('[discord] channel-to-bot bindings not loaded yet: database not ready (will retry before the next identity decision)');
+            }
+            return;
+          }
+          let result = await handle.query(
+            'SELECT channel_id, session_id, bot_key FROM discord_channel_session',
+            [],
+          );
+          for (let row of Array.isArray(result?.rows) ? result.rows : []) {
+            if (!row?.channel_id) continue;
+            channelBotKey.set(String(row.channel_id),
+              typeof row.bot_key === 'string' && row.bot_key ? row.bot_key : LEGACY_BOT_KEY);
+            if (row.session_id) sessionChannelID.set(String(row.session_id), String(row.channel_id));
+          }
+        } catch (error) {
+          // Before sql/005 has run (or with a driver that reports no rows) the maps
+          // stay empty and every channel falls back to the legacy token: the
+          // pre-multi-bot behaviour, safe by construction. The next identity
+          // decision tries again — a failed load is never cached as final.
+          console.warn('[discord] could not load channel-to-bot bindings: ' + String(error?.message || error));
+        } finally {
+          bindingsLoadInFlight = null;
         }
-      } catch (error) {
-        // Before sql/005 has run (or with a driver that reports no rows) the maps
-        // stay empty and every channel falls back to the legacy token: the
-        // pre-multi-bot behaviour, safe by construction.
-        console.warn('[discord] could not load channel-to-bot bindings: ' + String(error?.message || error));
-      }
+      })();
+      return await bindingsLoadInFlight;
     }
 
     // Which token speaks in THIS channel: the bound bot_key's config path, falling
     // back to the legacy token for 'default' keys, for a key whose per-bot token is
     // not configured, and for channels no binding names yet.
+    //
+    // Freshness lives HERE, at the single choke point every identity decision goes
+    // through — SendTool, react, channel-scoped reads, the typing indicator and the
+    // interaction follow-up all call this function. refreshInboundConfig() can run
+    // before the DB pool exists, and the gateway dispatch path never reloaded the
+    // maps at all (the atlas 2026-11-06 defect: every reply would have gone out as
+    // the legacy bot). One small SELECT per identity decision is the accepted cost
+    // (sanctioned in the coordinator's assignment); concurrent decisions coalesce
+    // into one query, and a failed load falls back to the legacy token instead of
+    // failing the call.
     async function tokenForChannel(channelID) {
+      await loadChannelBindings();
       let key = (channelID && channelBotKey.get(String(channelID))) || LEGACY_BOT_KEY;
       if (key === LEGACY_BOT_KEY)
         return await readConfig(KIKX_DISCORD_BOT_TOKEN_PATH, null);
@@ -136,6 +173,11 @@ export function setup(provide) {
     const typingSubscribedSessions = new Set();
     async function noteSessionBound({ sessionID, channelID }) {
       if (!sessionID || !channelID) return;
+      // Fresh rows FIRST: this runs on the inbound path right after the binding
+      // INSERT, and seeding 'default' from a map that never loaded is how every
+      // fleet channel ended up stamped as the legacy bot (atlas 2026-11-06).
+      // A channel whose row exists with a real bot_key is therefore never seeded.
+      await loadChannelBindings();
       sessionChannelID.set(String(sessionID), String(channelID));
       if (!channelBotKey.has(String(channelID)))
         channelBotKey.set(String(channelID), LEGACY_BOT_KEY);

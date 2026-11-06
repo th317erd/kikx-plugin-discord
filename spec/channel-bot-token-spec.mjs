@@ -90,6 +90,7 @@ function buildPlugin({
   bindings = [],
   bindingRow = { session_id: 'session-1' },
   gatewayEnabled = false,
+  dbReadyGate = null,   // () => bool; false reproduces the pool-not-ready startup window
 } = {}) {
   let registry = { tools: new Map() };
   registry.registerTool = (name, cls) => registry.tools.set(name, cls);
@@ -109,12 +110,16 @@ function buildPlugin({
 
   let db = () => ({
     async one(sql, params) {
+      if (dbReadyGate && !dbReadyGate())
+        throw new Error(`Cannot read properties of null (reading 'query')`);
       captured.queries.push({ sql, params });
       if (/discord_channel_session/.test(sql)) return bindingRow;
       if (/FROM discord_message_frame/.test(sql)) return null;
       return null;
     },
     async query(sql, params) {
+      if (dbReadyGate && !dbReadyGate())
+        throw new Error(`Cannot read properties of null (reading 'query')`);
       captured.queries.push({ sql, params });
       if (/SELECT channel_id, session_id, bot_key/.test(sql))
         return { rows: bindings };
@@ -345,4 +350,48 @@ test('an inbound message records the binding and scopes the typing subscription 
   assert.match(rest.join('\n'), /^\[kikx:reply-hint\]/);
   assert.match(rest.join('\n'), /discord_send/);
   assert.match(rest.join('\n'), new RegExp(CHANNEL));
+});
+
+// --- ordering reproduction: onInit ran before the pool existed ---------------
+// The atlas defect, end to end, from the real setup() entry point: startup
+// refreshInboundConfig() ran while the plugin DB pool was still null (migrations
+// applied AFTER it), nothing on the gateway path reloaded the maps, and every
+// fleet channel would have resolved the LEGACY token. Freshness now lives in
+// tokenForChannel(), so a binding row that exists only after that failed startup
+// load is still believed — no restart and no inbound message required.
+test('recovers when the startup binding load ran before the database was ready (ordering reproduction)', async () => {
+  let dbReady = false;               // production at 03:18:16: pool still null
+  let built = buildPlugin({
+    bindings: [{ channel_id: CHANNEL, session_id: 'session-1', bot_key: 'squeak' }],
+    dbReadyGate: () => dbReady,
+  });
+
+  // Prove the reproduction actually happened: startup load FAILED, maps empty.
+  let warnings = [];
+  let savedWarn = console.warn;
+  console.warn = (msg) => { warnings.push(String(msg)); };
+  try {
+    await built.plugin.onInit();     // gateway off: refresh runs, load FAILS, no socket
+  } finally {
+    console.warn = savedWarn;
+  }
+  assert.ok(warnings.some((w) => /could not load channel-to-bot bindings/.test(w)),
+    'the startup load must fail exactly like production: ' + JSON.stringify(warnings));
+
+  dbReady = true;                    // migrations + pool ready — atlas after 03:18:16
+
+  // No refreshInboundConfig() runs on the ordinary send path — the exact
+  // condition the fix must survive. The send itself performs the reload.
+  let { fetchImpl, requests } = recorder();
+  let result = await runTool(built.registry.getTool('discord:send'),
+    { actor: ACTOR, channel: CHANNEL, content: 'after pool ready' }, fetchImpl);
+
+  assert.equal(result.sent, true, JSON.stringify(result));
+  let post = requests.find((r) => r.method === 'POST');
+  assert.ok(post, 'a send must POST a message');
+  assert.equal(post.headers.Authorization, `Bot ${SQUEAK_TOKEN}`,
+    'the channel must answer as ITS bot even though the startup load failed — '
+    + 'a legacy token here means the maps were never reloaded (the atlas defect)');
+  assert.notEqual(post.headers.Authorization, `Bot ${LEGACY_TOKEN}`,
+    'legacy here means identity resolved from the stale, never-loaded map');
 });
