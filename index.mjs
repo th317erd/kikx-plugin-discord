@@ -1073,7 +1073,12 @@ export function setup(provide) {
         if (snap.connected === true) state = 'ready';
         else if (!snap.tokenPresent) state = 'no-token';
         else if (snap.gatewayEnabled === false) state = 'disabled';
-        else if (snap.gateway) state = 'connecting';
+        // A configured gateway with NO life behind it (no transport flag, no live
+        // socket) is down, not forever 'connecting'. 'connecting' now means a live
+        // socket is working toward a session — both facts re-read per poll from
+        // gateway.status(), so this route can never freeze (kink 4bb55fb993b92ea07f26380b).
+        else if (snap.gateway && (snap.gateway.socketOpen === true || snap.gateway.connected === true)) state = 'connecting';
+        else if (snap.gateway) state = 'down';
 
         response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({
@@ -1085,6 +1090,8 @@ export function setup(provide) {
           botUserId: snap.gateway?.userId ?? null,
           inboundChannelID: snap.inboundChannelID,
           inboundSessionID: snap.inboundSessionID,
+          socketOpen: snap.gateway?.socketOpen ?? false,
+          reconnectAttempt: snap.gateway?.attempt ?? null,
           startedAt: snap.startedAt,
           lastDispatchAt: snap.lastDispatchAt,
           lastError: snap.gateway?.fatal ?? null,

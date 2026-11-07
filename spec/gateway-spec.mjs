@@ -190,7 +190,7 @@ test('HEARTBEAT_ACK clears the pending flag so the next beat is sent', async () 
   assert.equal(socket.payloads(OP.HEARTBEAT).length, 2);
 });
 
-test('READY is the only thing that sets ready, and it records the session for resume', async () => {
+test('READY records the session for resume; READY and RESUMED are what set ready', async () => {
   let { gateway } = makeGateway();
   let readyCalls = [];
   gateway.onReady = async (info) => readyCalls.push(info);
