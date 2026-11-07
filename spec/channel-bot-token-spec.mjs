@@ -90,7 +90,9 @@ function buildPlugin({
   bindings = [],
   bindingRow = { session_id: 'session-1' },
   gatewayEnabled = false,
-  dbReadyGate = null,   // () => bool; false reproduces the pool-not-ready startup window
+  dbReadyGate = null,                // () => bool; false reproduces the pool-not-ready startup window
+  hasPluginMigrations = false,       // expose the plugin-migrations context the real create-server sets
+  pluginMigrationsPool = null,       // () => pool|null — null reproduces a pool migrations have not created yet
 } = {}) {
   let registry = { tools: new Map() };
   registry.registerTool = (name, cls) => registry.tools.set(name, cls);
@@ -136,7 +138,12 @@ function buildPlugin({
   };
 
   let context = {
-    context: { has: () => false, require: () => null },
+    context: {
+      has: (name) => (name === 'pluginMigrations' && hasPluginMigrations),
+      require: (name) => (name === 'pluginMigrations' && pluginMigrationsPool
+        ? { pool: pluginMigrationsPool() }
+        : null),
+    },
     registry,
     mountHttp: () => {},
     authorize: async (request) => {
@@ -394,4 +401,50 @@ test('recovers when the startup binding load ran before the database was ready (
     + 'a legacy token here means the maps were never reloaded (the atlas defect)');
   assert.notEqual(post.headers.Authorization, `Bot ${LEGACY_TOKEN}`,
     'legacy here means identity resolved from the stale, never-loaded map');
+});
+
+
+// --- boot ordering: the first load ran before the migration pool existed -------
+// Kink 2 (Avatar, 2026-11-07): every boot logs
+// "[discord] could not load channel-to-bot bindings: Cannot read properties of
+// null (reading 'query')" — create-server wraps the plugin database as
+// { query: (...a) => pluginMigrations.pool.query(...) }, and pool is created
+// lazily by migrations run(), so the handle EXISTS while dereferencing it throws
+// until boot passes that point. The 0cb2fdd retry guard contains this (warn once,
+// recover at the next identity decision); this test pins the source fix: the
+// first load WAITS for the migration pool, so boot neither fails nor warns.
+test('the startup load waits for the migration pool — no failure, no warning', async () => {
+  let dbReady = false;
+  let built = buildPlugin({
+    bindings: [{ channel_id: CHANNEL, session_id: 'session-1', bot_key: 'squeak' }],
+    dbReadyGate: () => dbReady,
+    hasPluginMigrations: true,
+    pluginMigrationsPool: () => (dbReady ? {} : null),
+  });
+
+  let warnings = [];
+  let savedWarn = console.warn;
+  console.warn = (msg) => { warnings.push(String(msg)); };
+  let initDone = false;
+  try {
+    let init = built.plugin.onInit().then(() => { initDone = true; });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(initDone, false,
+      'onInit must WAIT for the pool — returning first is how boot lost the load');
+    assert.ok(!warnings.some((w) => /could not load channel-to-bot bindings|not loaded yet/.test(w)),
+      'nothing may warn while the pool is about to exist: ' + JSON.stringify(warnings));
+    dbReady = true;
+    await init;
+  } finally {
+    console.warn = savedWarn;
+  }
+
+  // The maps were loaded on that first, waited-for attempt — the answer is the
+  // channel's own bot with no reload required along the way.
+  let { fetchImpl, requests } = recorder();
+  let result = await runTool(built.registry.getTool('discord:send'),
+    { actor: ACTOR, channel: CHANNEL, content: 'first load waited' }, fetchImpl);
+  assert.equal(result.sent, true, JSON.stringify(result));
+  assert.equal(requests.find((r) => r.method === 'POST').headers.Authorization, `Bot ${SQUEAK_TOKEN}`,
+    'the waited-for first load must have populated the maps with the real bot_key');
 });

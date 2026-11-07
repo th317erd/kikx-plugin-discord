@@ -135,6 +135,50 @@ export function setup(provide) {
       return await bindingsLoadInFlight;
     }
 
+    // The pool that db() dereferences: create-server wraps the plugin database as
+    // { query: (...a) => pluginMigrations.pool.query(...) }, and migrations run()
+    // creates pool LAZY — so at boot the handle EXISTS while dereferencing it
+    // throws "Cannot read properties of null (reading 'query')". That throw is the
+    // once-per-boot binding-load error (kink 2, Avatar 2026-11-07); waiting for
+    // the pool removes it at the source.
+    function pluginMigrationPool() {
+      try {
+        if (typeof context?.has !== 'function' || !context.has('pluginMigrations'))
+          return null;
+        return context.require('pluginMigrations')?.pool ?? null;
+      } catch (_error) {
+        return null;
+      }
+    }
+
+    // Resolves true once the migration pool exists, false when there is nothing
+    // here to wait for (no pluginMigrations in this context — tests, plugin-less
+    // hosts) or the deadline passes. The core context exposes no readiness event,
+    // so the wait is a bounded poll of the same lazy field db() will dereference;
+    // the deadline exists so a migration that never comes can never hang boot.
+    function whenPluginMigrationPoolReady({ waitMs }) {
+      if (typeof context?.has !== 'function' || !context.has('pluginMigrations'))
+        return Promise.resolve(false);
+      if (pluginMigrationPool())
+        return Promise.resolve(true);
+      if (!Number.isFinite(waitMs) || waitMs <= 0)
+        return Promise.resolve(false);
+      return new Promise((resolve) => {
+        let settled = false;
+        let finish = (ready) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(interval);
+          clearTimeout(deadline);
+          resolve(ready === true);
+        };
+        let interval = setInterval(() => { if (pluginMigrationPool()) finish(true); }, 250);
+        let deadline = setTimeout(() => finish(false), waitMs);
+        if (typeof interval.unref === 'function') interval.unref();
+        if (typeof deadline.unref === 'function') deadline.unref();
+      });
+    }
+
     // Which token speaks in THIS channel: the bound bot_key's config path, falling
     // back to the legacy token for 'default' keys, for a key whose per-bot token is
     // not configured, and for channels no binding names yet.
@@ -1018,6 +1062,16 @@ export function setup(provide) {
         console.warn('[discord] gateway not started: no bot token configured');
         return;
       }
+
+      // Boot ordering, waited HERE because refreshInboundConfig() below is what
+      // loads the channel→bot maps: the migration pool is created LAZY, so without
+      // this wait the first load dereferences null and logs the once-per-boot
+      // "could not load channel-to-bot bindings" error (kink 2). Bounded, and a
+      // no-op where no pluginMigrations context exists; if the deadline passes we
+      // boot anyway — the retry guard in loadChannelBindings() still covers it.
+      let dbReady = await whenPluginMigrationPoolReady({ waitMs: 60_000 });
+      if (!dbReady && typeof context?.has === 'function' && context.has('pluginMigrations'))
+        console.warn('[discord] migration pool still absent after 60s; booting anyway — the binding retry guard covers the first load');
 
       await refreshInboundConfig();
       observed.tokenPresent = true;
