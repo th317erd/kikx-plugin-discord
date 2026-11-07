@@ -122,6 +122,11 @@ export class DiscordGateway {
     this.attempt = 0;
     this.stopped = false;
     this.ready = false;
+    // Transport truth: true once the socket has proved life (HELLO arrived, or
+    // READY/RESUMED landed), false from the moment it dies. ready means a SESSION
+    // exists; connected means the TRANSPORT does — a resume keeps one while the
+    // other lags, and /health must be able to see both (kink 4bb55fb993b92ea07f26380b).
+    this.connected = false;
     // Non-null once a fatal close code has been seen. It latches so a later transient
     // failure cannot quietly resume a loop that is known to be pointless.
     this.fatal = null;
@@ -205,6 +210,7 @@ export class DiscordGateway {
         return;
 
       this.ready = false;
+      this.connected = false;
       this.clearHeartbeat();
       this.socket = null;
       if (this.stopped) return;
@@ -232,6 +238,10 @@ export class DiscordGateway {
 
     switch (payload.op) {
       case OP.HELLO: {
+        // The socket itself speaks: proof of transport life that does not wait for
+        // READY — a resumed session never sends a second READY, so this is what
+        // keeps /health from reading a live transport as frozen.
+        this.connected = true;
         let interval = payload?.d?.heartbeat_interval;
         if (typeof interval !== 'number' || !(interval > 0)) {
           this.log('error', 'gateway HELLO carried no heartbeat_interval');
@@ -280,8 +290,21 @@ export class DiscordGateway {
   }
 
   async handleDispatch(eventType, data) {
+    // A RESUME is answered with RESUMED, never a second READY. Without restoring
+    // the session flag here, the close listener's ready=false became permanent:
+    // the session kept delivering while /health answered 'connecting' for hours
+    // (atlas 2026-11-07: ready log older than the sample, reconnect attempt 9,
+    // lastDispatchAt minutes old — kink 4bb55fb993b92ea07f26380b).
+    if (eventType === 'RESUMED') {
+      this.ready = true;
+      this.connected = true;
+      this.attempt = 0;
+      this.log('info', 'gateway session resumed');
+      return;
+    }
     if (eventType === 'READY') {
       this.ready = true;
+      this.connected = true;
       this.attempt = 0;
       this.sessionID = data?.session_id ?? null;
       this.resumeURL = data?.resume_gateway_url ?? null;
@@ -367,6 +390,7 @@ export class DiscordGateway {
     this.clearReconnect();
     this.clearHeartbeat();
     this.ready = false;
+    this.connected = false;
     this.log('error', `gateway fatal close ${code}: ${reason} — not reconnecting; fix the configuration and restart the plugin`);
   }
 
@@ -392,6 +416,7 @@ export class DiscordGateway {
     let socket = this.socket;
     this.clearHeartbeat();
     this.ready = false;
+    this.connected = false;
 
     // Detach the socket BEFORE closing it, so the close listener sees a superseded
     // socket and returns. The listener is now the single owner of the
@@ -428,6 +453,7 @@ export class DiscordGateway {
   stop() {
     this.stopped = true;
     this.ready = false;
+    this.connected = false;
     this.clearHeartbeat();
     this.clearReconnect();
     let socket = this.socket;
@@ -440,6 +466,12 @@ export class DiscordGateway {
   status() {
     return {
       ready: this.ready,
+      // Re-read from the LIVE socket on every call — this is the per-poll socket
+      // re-read the health report asked for: ready can lag the transport (a
+      // resume restores it only when RESUMED lands), so a monitor gets the
+      // socket's own truth alongside the session flag instead of one stale bit.
+      connected: this.connected,
+      socketOpen: !!this.socket && this.socket.readyState === 1,
       sessionID: this.sessionID,
       sequence: this.sequence,
       attempt: this.attempt,
