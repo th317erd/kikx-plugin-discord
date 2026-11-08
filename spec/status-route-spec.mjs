@@ -44,7 +44,7 @@ class FakeSocket {
 class FakePluginInterface {}
 
 function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
-  let state = { authorizations: [], frames: [], handler: null, mountOptions: null };
+  let state = { authorizations: [], frames: [], handler: null, mountOptions: null, subscriptions: [] };
 
   let db = () => ({
     async one(sql) {
@@ -69,6 +69,10 @@ function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
         : { allowed: false, reason: 'no grant for discord.inbound' };
     },
     db,
+    // The real seam noteSessionBound uses: core hands the plugin a subscribe()
+    // bound to the event bus. Recorded so a spec can prove the subscription was
+    // scoped to exactly the bound session, not merely that a call happened.
+    subscribe: async (fn, opts) => { state.subscriptions.push({ fn, opts }); },
     appendFrame: async (sessionID, input) => {
       state.frames.push({ sessionID, input });
       return { session: { id: sessionID }, frame: { id: 'frame-1' } };
@@ -208,4 +212,65 @@ test('the interactions mount stays public, because Discord cannot hold a Kikx se
   // Guards the opposite mistake: locking the whole mount down would 401 Discord itself.
   let { state } = buildPlugin({ token: TOKEN });
   assert.equal(state.mountOptions?.auth, 'public');
+});
+
+
+test('NEGATIVE CONTROL: before any binding, the /status typing fields sit at their origin', async () => {
+  // The four fields must exist and be honest when nothing has happened yet:
+  // 0 subscriptions, 0 session->channel records, 0 open windows, null outcome.
+  // A field that is absent here would be indistinguishable from a field the
+  // route never added — presence-at-origin is the control.
+  let { plugin, getStatus } = buildPlugin({ token: TOKEN, viewer: { id: 'admin' } });
+  await withFakeNetwork(async () => {
+    await plugin.onInit();
+    let socket = FakeSocket.instances[0];
+    await socket.deliver({ op: OP.HELLO, d: { heartbeat_interval: 41250 } });
+    await socket.deliver({ op: OP.DISPATCH, t: 'READY', s: 1, d: { user: { id: 'bot-9' }, session_id: 'gw-1' } });
+
+    let { status, body } = await getStatus({ identity: { id: 'admin' } });
+    assert.equal(status, 200);
+    assert.equal(body.typingSubscribedSessions, 0, 'no subscription may exist before a binding');
+    assert.equal(body.sessionChannelIDSize, 0, 'nor a session->channel record');
+    assert.equal(body.typingOpenCount, 0, 'nor an open typing window');
+    assert.equal(body.lastTypingOutcome, null, 'null is the honest never-POSTed origin');
+    plugin.onShutdown();
+  });
+});
+
+test('/status typing fields reflect a real noteSessionBound -> subscribe path', async () => {
+  // The chain that exists in production and nowhere else: an authorized inbound
+  // message resolves channel -> session (the harness db's discord_channel_session
+  // row), and that resolution is the ONLY thing that ever subscribes the typing
+  // indicator (index.mjs noteSessionBound). The status must show the result.
+  let { plugin, getStatus, state } = buildPlugin({ token: TOKEN, allowed: true, viewer: { id: 'admin' } });
+  await withFakeNetwork(async () => {
+    await plugin.onInit();
+    let socket = FakeSocket.instances[0];
+    await socket.deliver({ op: OP.HELLO, d: { heartbeat_interval: 41250 } });
+    await socket.deliver({ op: OP.DISPATCH, t: 'READY', s: 1, d: { user: { id: 'bot-9' }, session_id: 'gw-1' } });
+
+    // Suppress only the harness's binding-load noise (the fake db's query shape
+    // is not this spec's subject); a failed subscribe would still be caught by
+    // the subscription assertions below, not by a log.
+    let warn = console.warn;
+    console.warn = () => {};
+    try {
+      await socket.deliver({
+        op: OP.DISPATCH, t: 'MESSAGE_CREATE', s: 2,
+        d: { id: 'msg-10', channel_id: 'chan-1', content: 'hello', type: 0, author: { id: 'u1', username: 'wyatt' } },
+      });
+    } finally {
+      console.warn = warn;
+    }
+
+    assert.equal(state.subscriptions.length, 1, 'noteSessionBound must subscribe exactly once');
+    assert.deepEqual(state.subscriptions[0].opts, { sessions: ['session-1'] }, 'scoped to the bound session');
+
+    let { body } = await getStatus({ identity: { id: 'admin' } });
+    assert.equal(body.typingSubscribedSessions, 1, 'the subscribe path must be visible in /status');
+    assert.equal(body.sessionChannelIDSize, 1, 'the binding must be visible too');
+    assert.equal(body.typingOpenCount, 0, 'no frame event has fired: nothing armed yet');
+    assert.equal(body.lastTypingOutcome, null, 'no POST attempted: the outcome stays null until one is');
+    plugin.onShutdown();
+  });
 });

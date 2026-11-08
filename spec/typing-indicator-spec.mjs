@@ -185,19 +185,28 @@ test('NEGATIVE CONTROL: an unbound session performs ZERO typing calls', async ()
   assert.equal(clock.pending(), 0, 'nor arm a timer');
 });
 
-test('a 403 is reported (a real permission fact); a 204 is silent; neither throws', async () => {
+test('a 403 is reported (a real permission fact); a 204 owes no WARN; neither throws', async () => {
   let refused = harness({ status: 403 });
   refused.indicator.onEvent(refused.frameEvent('BeginTyping'));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(refused.posts.length, 1, 'a refused POST is fire-and-forget, not a throw');
-  assert.equal(refused.logs.length, 1);
-  assert.equal(refused.logs[0].level, 'warn');
-  assert.match(refused.logs[0].message, /chan_1.*403/);
+
+  // Level-filtered, never positional: arming also emits exactly one info line,
+  // so each level is counted on its own instead of by index into a shared array.
+  let warns = refused.logs.filter((entry) => entry.level === 'warn');
+  assert.equal(warns.length, 1, 'exactly one warn: the refusal fact is owed');
+  assert.match(warns[0].message, /chan_1.*403/);
+  let infos = refused.logs.filter((entry) => entry.level === 'info');
+  assert.equal(infos.length, 1, 'exactly one arm line: arming is observable too');
+  assert.match(infos[0].message, /typing armed in channel chan_1/);
+  assert.equal(refused.indicator.lastTypingOutcome().result, '403', 'the outcome is recorded for /status');
 
   let ok = harness({ status: 204 });
   ok.indicator.onEvent(ok.frameEvent('BeginTyping'));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(ok.logs.length, 0, 'success owes no log line');
+  assert.equal(ok.logs.filter((entry) => entry.level === 'warn').length, 0, 'success owes no WARN');
+  assert.equal(ok.logs.filter((entry) => entry.level === 'info').length, 1, 'the arm info line is expected on success too');
+  assert.equal(ok.indicator.lastTypingOutcome().result, '204', 'success is silent in the journal, visible in /status');
 });
 
 test('no token for the channel means no fetch at all', async () => {

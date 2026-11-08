@@ -22,7 +22,9 @@
 // Everything here is fire-and-forget. A typing indicator must never delay or fail
 // a send, and a 403/429 is reported (that is a real permission/ratelimit fact the
 // operator needs) while every other outcome is swallowed: Discord owes us nothing
-// for an indicator.
+// for an indicator. Swallowed, however, must not mean invisible: lastTypingOutcome
+// records what happened so /status can answer "is typing actually working?"
+// without guessing (a successful 204 logs nothing).
 // =============================================================================
 
 const DISCORD_API = 'https://discord.com/api/v10';
@@ -38,6 +40,11 @@ const DEFAULT_ARM_MS = 8000;
 // emitting frames forever (a stuck agent, a hot loop) would show "typing..." until
 // the end of time. 60s says "working on it"; an hour says "broken".
 const DEFAULT_CAP_MS = 60000;
+
+// Minimum spacing for the 'typing armed' info log, per channel: first arm logs,
+// then at most once per interval — a hot session must not flood the journal, but
+// an operator can still see typing arming during a long turn.
+const ARMED_LOG_MS = 60000;
 
 // Tool-call frames (DiscordSendToolFrame and core's own tool frames) must not arm
 // the indicator: right after noteSent() stops it, the tool frame's own
@@ -61,12 +68,29 @@ export function createTypingIndicator({
   // Injectable so the cap is testable without sleeping a real minute.
   const now = () => nowImpl();
 
+  // Last POST outcome for /status: Discord's own answer ('204'|'403'|'429') or
+  // the reason no answer exists ('no-token'|'no-channel'|'error'). null = no POST
+  // has ever been attempted (the honest "typing never ran" state).
+  let lastOutcome = null;
+  const record = (channelID, result) => {
+    lastOutcome = { at: now(), channelID, result };
+  };
+  // channelID -> ts of the last 'typing armed' info log (rate limiter).
+  const armedLoggedAt = new Map();
+
   const getFetch = () => fetchImpl || globalThis.fetch;
 
   async function post(channelID) {
+    if (!channelID) {
+      record(null, 'no-channel');
+      return;
+    }
     try {
       let token = tokenForChannel ? await tokenForChannel(channelID) : null;
-      if (!token) return;
+      if (!token) {
+        record(channelID, 'no-token');
+        return;
+      }
       let res = await getFetch()(
         `${DISCORD_API}/channels/${encodeURIComponent(channelID)}/typing`,
         {
@@ -74,12 +98,18 @@ export function createTypingIndicator({
           headers: { Authorization: `Bot ${token}`, 'User-Agent': USER_AGENT },
         },
       );
+      let status = res && typeof res.status === 'number' ? res.status : null;
+      record(
+        channelID,
+        status === 204 || status === 403 || status === 429 ? String(status) : 'error',
+      );
       // Only the outcomes that mean something are reported: 403 (this bot may not
       // speak here) and 429 (we are re-arming too fast). Anything else — a 204, a
-      // dropped socket — is an indicator nobody is owed.
-      if (res && (res.status === 403 || res.status === 429))
-        log('warn', `typing indicator refused in channel ${channelID} (HTTP ${res.status})`);
+      // dropped socket — is an indicator nobody is owed (it lives in lastOutcome).
+      if (status === 403 || status === 429)
+        log('warn', `typing indicator refused in channel ${channelID} (HTTP ${status})`);
     } catch (error) {
+      record(channelID, 'error');
       log('warn', `typing indicator failed in channel ${channelID}: ${String(error?.message || error)}`);
     }
   }
@@ -114,6 +144,13 @@ export function createTypingIndicator({
       return;
     }
     open.set(channelID, { startedAt: nowMs, timer: setTimeoutImpl(() => tick(channelID), armMs) });
+    // Rate-limited live signal: the first arm per channel logs, then at most once
+    // per ARMED_LOG_MS — enough to prove typing is armed in production without
+    // guessing, without journaling every window.
+    if (nowMs - (armedLoggedAt.get(channelID) || 0) >= ARMED_LOG_MS) {
+      armedLoggedAt.set(channelID, nowMs);
+      log('info', `[discord] typing armed in channel ${channelID}`);
+    }
     post(channelID);
   }
 
@@ -163,5 +200,8 @@ export function createTypingIndicator({
     noteSent,
     // Test seam: how many channels currently show as typing.
     openCount: () => open.size,
+    // Status seam: last POST outcome { at, channelID, result }, or null if no
+    // POST was ever attempted.
+    lastTypingOutcome: () => lastOutcome,
   };
 }

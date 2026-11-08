@@ -1117,7 +1117,14 @@ export function setup(provide) {
         }
 
         response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        response.end(JSON.stringify({ ok: true, ...gatewaySnapshot() }));
+        response.end(JSON.stringify({
+          ok: true,
+          ...gatewaySnapshot(),
+          typingSubscribedSessions: typingSubscribedSessions.size,
+          sessionChannelIDSize: sessionChannelID.size,
+          typingOpenCount: typingIndicator.openCount(),
+          lastTypingOutcome: typingIndicator.lastTypingOutcome(),
+        }));
         return;
       }
 
