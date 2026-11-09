@@ -43,7 +43,7 @@ class FakeSocket {
 
 class FakePluginInterface {}
 
-function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
+function buildPlugin({ token = null, allowed = true, viewer = null, queryFn = null } = {}) {
   let state = { authorizations: [], frames: [], handler: null, mountOptions: null, subscriptions: [] };
 
   let db = () => ({
@@ -51,7 +51,11 @@ function buildPlugin({ token = null, allowed = true, viewer = null } = {}) {
       if (/discord_channel_session/.test(sql)) return { session_id: 'session-1' };
       return null;
     },
-    async query() { return { rowCount: 1 }; },
+    // The binding-load query (loadChannelBindings). Default: an empty result
+    // shape, so boot subscribes nothing — the honest origin. A spec that needs
+    // boot bindings passes queryFn returning { rows: [...] }, which is how the
+    // root-cause fix is exercised: subscriptions WITHOUT any inbound traffic.
+    async query() { return queryFn ? await queryFn() : { rowCount: 1 }; },
   });
 
   let context = {
@@ -237,21 +241,37 @@ test('NEGATIVE CONTROL: before any binding, the /status typing fields sit at the
   });
 });
 
-test('/status typing fields reflect a real noteSessionBound -> subscribe path', async () => {
-  // The chain that exists in production and nowhere else: an authorized inbound
-  // message resolves channel -> session (the harness db's discord_channel_session
-  // row), and that resolution is the ONLY thing that ever subscribes the typing
-  // indicator (index.mjs noteSessionBound). The status must show the result.
-  let { plugin, getStatus, state } = buildPlugin({ token: TOKEN, allowed: true, viewer: { id: 'admin' } });
+test('/status typing fields reflect the boot binding-load -> subscribe path (no inbound needed)', async () => {
+  // The ROOT-CAUSE FIX, asserted: the subscription now comes from the boot
+  // binding load (rows -> sessionChannelID -> subscribeTypingFromBindings), so
+  // it exists before any inbound message. noteSessionBound — the old ONLY hook —
+  // now remains the incremental path for a session bound after boot, and its
+  // typingSubscribedSessions guard must keep the total at ONE subscription
+  // (a double subscribe would multiply POSTs through two bus entries).
+  let bootRows = () => Promise.resolve({
+    rows: [{ channel_id: 'chan-1', session_id: 'session-1', bot_key: 'squeak' }],
+  });
+  let { plugin, getStatus, state } = buildPlugin({
+    token: TOKEN, allowed: true, viewer: { id: 'admin' }, queryFn: bootRows,
+  });
   await withFakeNetwork(async () => {
-    await plugin.onInit();
+    await plugin.onInit();     // onInit loads bindings FIRST: subscription exists here
     let socket = FakeSocket.instances[0];
     await socket.deliver({ op: OP.HELLO, d: { heartbeat_interval: 41250 } });
     await socket.deliver({ op: OP.DISPATCH, t: 'READY', s: 1, d: { user: { id: 'bot-9' }, session_id: 'gw-1' } });
 
-    // Suppress only the harness's binding-load noise (the fake db's query shape
-    // is not this spec's subject); a failed subscribe would still be caught by
-    // the subscription assertions below, not by a log.
+    // BEFORE any inbound message: the boot path must already have subscribed.
+    assert.equal(state.subscriptions.length, 1, 'boot binding-load must subscribe with zero inbound');
+    assert.deepEqual(state.subscriptions[0].opts, { sessions: ['session-1'] }, 'scoped to the bound session');
+
+    let { body } = await getStatus({ identity: { id: 'admin' } });
+    assert.equal(body.typingSubscribedSessions, 1, 'the boot subscribe path must be visible in /status');
+    assert.equal(body.sessionChannelIDSize, 1, 'and the binding row too');
+    assert.equal(body.typingOpenCount, 0, 'no frame event has fired: nothing armed yet');
+    assert.equal(body.lastTypingOutcome, null, 'no POST attempted: the outcome stays null until one is');
+
+    // Now the incremental path: an authorized inbound resolves the same channel.
+    // noteSessionBound runs, and the guard must NOT create a second subscription.
     let warn = console.warn;
     console.warn = () => {};
     try {
@@ -262,15 +282,60 @@ test('/status typing fields reflect a real noteSessionBound -> subscribe path', 
     } finally {
       console.warn = warn;
     }
+    assert.equal(state.subscriptions.length, 1, 'noteSessionBound must not double-subscribe an already-bound session');
+    let after = await getStatus({ identity: { id: 'admin' } });
+    assert.equal(after.body.typingSubscribedSessions, 1, 'still exactly one subscription');
+    assert.equal(after.body.sessionChannelIDSize, 1, 'and one session->channel record');
+    plugin.onShutdown();
+  });
+});
 
-    assert.equal(state.subscriptions.length, 1, 'noteSessionBound must subscribe exactly once');
-    assert.deepEqual(state.subscriptions[0].opts, { sessions: ['session-1'] }, 'scoped to the bound session');
+test('REGRESSION: zero inbound traffic, a generation frame -> typing POST attempted', async () => {
+  // The exact production failure this branch fixes: before it, the ONLY
+  // subscribe hook ran on the inbound path — that path saw only denials and
+  // bot_author skips, so NO subscription ever existed and zero typing POSTs
+  // were EVER attempted (silence nobody could distinguish from "it works").
+  // Now: boot subscribes from the binding rows, one committed frame in that
+  // session drives a real POST to Discord's typing endpoint, and /status shows
+  // both the subscription and the outcome. No MESSAGE_CREATE is delivered here
+  // — that is the point.
+  let bootRows = () => Promise.resolve({
+    rows: [{ channel_id: 'chan-1', session_id: 'session-1', bot_key: 'squeak' }],
+  });
+  let { plugin, getStatus, state } = buildPlugin({
+    token: TOKEN, allowed: true, viewer: { id: 'admin' }, queryFn: bootRows,
+  });
+  await withFakeNetwork(async () => {
+    await plugin.onInit();
+    let socket = FakeSocket.instances[0];
+    await socket.deliver({ op: OP.HELLO, d: { heartbeat_interval: 41250 } });
+    await socket.deliver({ op: OP.DISPATCH, t: 'READY', s: 1, d: { user: { id: 'bot-9' }, session_id: 'gw-1' } });
+
+    assert.equal(state.subscriptions.length, 1, 'boot must have subscribed without any inbound message');
+
+    // Capture Discord's typing POST (withFakeNetwork restores fetch afterwards).
+    let posts = [];
+    globalThis.fetch = async (url, init) => {
+      posts.push({ url: String(url), auth: init.headers && init.headers.Authorization });
+      return { status: 204 };
+    };
+
+    // One committed frame in the bound session, exactly as the bus dispatches it.
+    await state.subscriptions[0].fn({
+      type: 'frame.added', sessionID: 'session-1',
+      frame: { id: 'f1', type: 'BeginTyping' },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(posts.length, 1, 'a generation frame in a boot-subscribed session MUST attempt the POST');
+    assert.equal(posts[0].url, 'https://discord.com/api/v10/channels/chan-1/typing');
+    assert.equal(posts[0].auth, 'Bot ' + TOKEN, 'with the SAME token this channel replies use');
 
     let { body } = await getStatus({ identity: { id: 'admin' } });
-    assert.equal(body.typingSubscribedSessions, 1, 'the subscribe path must be visible in /status');
-    assert.equal(body.sessionChannelIDSize, 1, 'the binding must be visible too');
-    assert.equal(body.typingOpenCount, 0, 'no frame event has fired: nothing armed yet');
-    assert.equal(body.lastTypingOutcome, null, 'no POST attempted: the outcome stays null until one is');
+    assert.equal(body.typingSubscribedSessions, 1, 'the root-cause fix is visible in /status');
+    assert.equal(body.typingOpenCount, 1, 'the window opened on the generation frame');
+    assert.equal(body.lastTypingOutcome && body.lastTypingOutcome.result, '204',
+      'and the POST outcome is observable — typing is proven, not assumed');
     plugin.onShutdown();
   });
 });
