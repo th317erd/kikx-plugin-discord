@@ -67,8 +67,12 @@ payload, so the later swap is transparent. Core stays read-only: reported, not m
 ## 4. Idle / stuck-state self-clear (consumer-side, mandatory)
 
 Consumer keeps `lastPhaseAt` per session; with no `ai.thinking` event (`start`/`idle`) for
-`thinkingIdleMs` (default 15_000; > 2× heartbeat) it synthesizes `end{error}` locally:
-clears open typing, records `lastTypingOutcome`, logs once. A crashed or absent emitter
+`thinkingIdleMs` (default 15_000; > 2× heartbeat) the 15 s watchdog fires:
+`fireWatchdog` clears the open typing window and logs once (rate-limited warn
+`[discord] typing trigger silent in channel <id> (watchdog)`) — **log-only**: it NEVER
+mutates `lastTypingOutcome` (that field stays contractually "last POST outcome"; the
+pre-ruling clause that said the watchdog "records" it is superseded by decision 1,
+watchdog = log-only). Spec seam: `watchdogCount()`. A crashed or absent emitter
 can never leave a stuck "thinking" state. Emitter-side `idle` ≤5s feeds re-arm cadence.
 
 ## 5. First consumer — Discord typing (the root-cause fix)
