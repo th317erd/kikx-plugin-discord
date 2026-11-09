@@ -233,6 +233,26 @@ test('a 403 is reported (a real permission fact); a 204 owes no WARN; neither th
   ok.indicator.stopAll();
 });
 
+test('a 500 (any unexpected HTTP status) stays visible in /status: recorded, no throw, no warn-flood', async () => {
+  // Step-6 gap: every non-204/403/429 response used to collapse to 'error'
+  // with no evidence — silent non-403/429 statuses were the original
+  // observability risk. Any HTTP answer is a fact, so String(status) goes
+  // into lastTypingOutcome verbatim; 'error' is reserved for a POST that
+  // never received an HTTP answer (the thrown/no-response case).
+  let broken = harness({ status: 500 });
+  broken.think('ses_1', 'start');
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(broken.posts.length, 1, 'a 500 POST is fire-and-forget, not a throw');
+  assert.equal(broken.indicator.lastTypingOutcome().result, '500',
+    'the numeric status must reach /status verbatim');
+  assert.equal(broken.logs.filter((entry) => entry.level === 'warn').length, 0,
+    'a 500 owes no warn — only 403/429 are refusal facts; no warn-flood');
+  assert.equal(broken.logs.filter((entry) => entry.level === 'info').length, 1,
+    'the single arm info line is still expected');
+  broken.indicator.stopAll();
+});
+
 test('no token for the channel means no fetch at all', async () => {
   let clock = fakeClock();
   let posts = [];

@@ -83,8 +83,10 @@ export function createTypingIndicator({
   // Injectable so the cap and the watchdog are testable without sleeping.
   const now = () => nowImpl();
 
-  // Last POST outcome for /status: Discord's own answer ('204'|'403'|'429') or
-  // the reason no answer exists ('no-token'|'no-channel'|'error'). null = no POST
+  // Last POST outcome for /status: Discord's own answer as String(status) —
+  // ANY HTTP status recorded verbatim ('204'|'403'|'429'|'401'|'404'|'500'|…)
+  // — or the reason no answer exists ('no-token'|'no-channel'|'error', where
+  // 'error' now means exactly: the POST received no HTTP answer). null = no POST
   // has ever been attempted (the honest "typing never ran" state).
   let lastOutcome = null;
   const record = (channelID, result) => {
@@ -114,7 +116,7 @@ export function createTypingIndicator({
       let status = res && typeof res.status === 'number' ? res.status : null;
       record(
         channelID,
-        status === 204 || status === 403 || status === 429 ? String(status) : 'error',
+        status === null ? 'error' : String(status),
       );
       // Only the outcomes that mean something are reported: 403 (this bot may not
       // speak here) and 429 (we are re-arming too fast). Anything else — a 204, a
