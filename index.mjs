@@ -1439,6 +1439,19 @@ export function setup(provide) {
     // teardown and would silently skip onInit and onShutdown.
     return {
       async onInit() {
+        // Migration pool FIRST, then bindings: loadChannelBindings dereferences the
+        // pool migrations create lazily, so an un-awaited first load fires the
+        // once-per-boot null-pool warn (kink 2) before gatewayLoop()'s own wait
+        // ever runs. e675d7f shipped that wait inside gatewayLoop because its
+        // onInit was the one-liner `return gatewayLoop()`; ai-thinking's bindings-
+        // first onInit was authored against 0cb2fdd, where no wait existed --
+        // merging the two left this first load unguarded (spec channel-bot-token-
+        // spec:416, Avatar 2026-11-13). Bounded, and a no-op where no
+        // pluginMigrations context exists; if the deadline passes we proceed --
+        // loadChannelBindings' retry guard still covers the first load.
+        let poolReady = await whenPluginMigrationPoolReady({ waitMs: 60_000 });
+        if (!poolReady && typeof context?.has === 'function' && context.has('pluginMigrations'))
+          console.warn('[discord] migration pool still absent after 60s; booting anyway — the binding retry guard covers the first load');
         // Bindings FIRST: loadChannelBindings subscribes typing to every row it
         // reads, so the indicator's sessions are known before the gateway can
         // route a single frame -- with no inbound message required (the root-cause

@@ -448,3 +448,43 @@ test('the startup load waits for the migration pool — no failure, no warning',
   assert.equal(requests.find((r) => r.method === 'POST').headers.Authorization, `Bot ${SQUEAK_TOKEN}`,
     'the waited-for first load must have populated the maps with the real bot_key');
 });
+
+// --- the boot-path typing subscription waits WITH the bindings ----------------
+// Merge seam (Avatar, 2026-11-13): e675d7f's onInit was the one-liner
+// `return gatewayLoop()` -- the pool wait lived INSIDE gatewayLoop -- while
+// ai-thinking's bindings-first onInit, authored against 0cb2fdd, never had the
+// wait. Merged, onInit's first load dereferenced the lazy-null pool and fired
+// the once-per-boot warn the wait exists to prevent. This pins the pairing:
+// no warn AND the boot-path subscription exists with zero inbound traffic (the
+// root-cause fix that must survive every future merge).
+test('the boot-path typing subscription waits with the pool — no warn, subscription present', async () => {
+  let dbReady = false;
+  let built = buildPlugin({
+    bindings: [{ channel_id: CHANNEL, session_id: 'session-1', bot_key: 'squeak' }],
+    dbReadyGate: () => dbReady,
+    hasPluginMigrations: true,
+    pluginMigrationsPool: () => (dbReady ? {} : null),
+  });
+
+  let warnings = [];
+  let savedWarn = console.warn;
+  console.warn = (msg) => { warnings.push(String(msg)); };
+  let initDone = false;
+  try {
+    let init = built.plugin.onInit().then(() => { initDone = true; });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(initDone, false, 'onInit must be waiting for the pool');
+    dbReady = true;                    // migrations + pool arrive
+    await init;
+  } finally {
+    console.warn = savedWarn;
+  }
+
+  assert.ok(!warnings.some((w) => /could not load channel-to-bot bindings|not loaded yet/.test(w)),
+    'nothing may warn while the pool is about to exist: ' + JSON.stringify(warnings));
+  assert.equal(built.captured.subscribes.length, 1,
+    'the boot path must subscribe typing from the waited-for bindings with no inbound message: '
+    + JSON.stringify(built.captured.subscribes.map((s) => s.options)));
+  assert.deepEqual(built.captured.subscribes[0].options.sessions, ['session-1'],
+    'the boot-path subscription must be scoped to the bound session');
+});
