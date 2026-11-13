@@ -19,6 +19,7 @@ import { DiscordInboundRouter, REPLY_HINT_MARKER } from './inbound-router.mjs';
 import { DISCORD_MESSAGE_LIMIT, splitDiscordMessage } from './message-split.mjs';
 import { registerDiscordTools } from './discord-tools.mjs';
 import { createTypingIndicator } from './typing.mjs';
+import { createThinkingAdapter } from './thinking.mjs';
 
 export const pluginName = 'discord';
 
@@ -122,6 +123,11 @@ export function setup(provide) {
               typeof row.bot_key === 'string' && row.bot_key ? row.bot_key : LEGACY_BOT_KEY);
             if (row.session_id) sessionChannelID.set(String(row.session_id), String(row.channel_id));
           }
+          // Truthy ONLY when the SELECT ran to completion: the tail below gates
+          // subscribeTypingFromBindings on this so the db-not-ready window (which
+          // returns earlier) and a failed query never subscribe against an empty
+          // map. Callers that merely await the load see no difference.
+          return true;
         } catch (error) {
           // Before sql/005 has run (or with a driver that reports no rows) the maps
           // stay empty and every channel falls back to the legacy token: the
@@ -132,7 +138,16 @@ export function setup(provide) {
           bindingsLoadInFlight = null;
         }
       })();
-      return await bindingsLoadInFlight;
+      let loaded = await bindingsLoadInFlight;
+      // Bindings loaded = a known session->channel set: subscribe typing to it
+      // here, whichever path asked for the load (gateway boot, an identity
+      // decision, a status read). Guarded to run ONLY when the query actually
+      // ran, so the db-not-ready window keeps its warn-once behaviour and never
+      // subscribes against an empty map; subscribeTypingSession's per-session
+      // guard makes every repeat load free.
+      if (loaded && typeof subscribeTypingSession === 'function')
+        await subscribeTypingFromBindings();
+      return loaded;
     }
 
     // The pool that db() dereferences: create-server wraps the plugin database as
@@ -209,12 +224,63 @@ export function setup(provide) {
       log: (level, message) => console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log'](`[discord] ${message}`),
     });
 
-    // Called by the router once a channel has resolved to a session (existing
-    // binding or auto-bind). Records session->channel for typing, and subscribes
-    // the indicator to THAT session's events exactly once: the plugin event bus
-    // copies the session set at subscribe time, and an unscoped subscription
-    // receives nothing at all (plugin-events.mjs #dispatch).
+    // The ai.thinking trigger adapter (docs/ai-thinking-trigger-20261109.md): the
+    // plugin's ONE bus handler. It classifies core's frame events into the
+    // start/idle/end contract, so typing is driven by the generation lifecycle --
+    // never by inbound traffic. That is the root-cause fix: before this branch the
+    // ONLY subscribe hook ran on the inbound path, that path saw only denials and
+    // bot_author skips, no subscription was ever created, and zero typing POSTs
+    // were ever attempted.
+    const thinkingAdapter = createThinkingAdapter({
+      resolveChannel: (sessionID) => sessionChannelID.get(String(sessionID)) || null,
+      botKeyForChannel: (channelID) => channelBotKey.get(String(channelID)) || null,
+    });
+
+    // The plugin event bus copies the session set at subscribe time, and an
+    // unscoped subscription receives nothing at all (plugin-events.mjs
+    // #dispatch) -- so subscriptions are created per session, exactly once.
     const typingSubscribedSessions = new Set();
+
+    // Subscribe ONE session through the FULL chain, idempotently: the bus hands
+    // core's frame events to the adapter (link 1), and the adapter hands the
+    // derived ai.thinking phases to typing (link 2). Both are scoped to the same
+    // session -- an unscoped subscriber receives nothing anywhere in this chain
+    // (plugin-events.mjs #dispatch, and the adapter mirrors that rule) -- and one
+    // guard covers both, so double-subscribing can never multiply POSTs through
+    // two bus entries. When core emits ai.thinking itself (the platform gap in
+    // the PR body), link 1 disappears and this becomes one bus subscription of
+    // exactly this shape.
+    //
+    // The bus subscribe is absent only in harnesses that do not provide it, and
+    // that must not break inbound routing -- such an instance simply never arms
+    // typing.
+    async function subscribeTypingSession(sessionID) {
+      let key = String(sessionID);
+      if (typingSubscribedSessions.has(key)) return;
+      if (typeof subscribe !== 'function') return;
+      typingSubscribedSessions.add(key);
+      try {
+        await subscribe(thinkingAdapter.onEvent, { sessions: [key] });
+        thinkingAdapter.subscribe(typingIndicator.onThinking, { sessions: [key] });
+      } catch (error) {
+        typingSubscribedSessions.delete(key);
+        console.warn('[discord] could not subscribe the typing indicator: ' + String(error?.message || error));
+      }
+    }
+
+    // After EVERY successful binding load, subscribe each session->channel row.
+    // This is the boot path -- loadChannelBindings itself runs it, so subscriptions
+    // exist whether or not any inbound message ever arrives. Rows load once into
+    // sessionChannelID, and the per-session guard makes repeated loads free.
+    async function subscribeTypingFromBindings() {
+      for (let sessionID of sessionChannelID.keys())
+        await subscribeTypingSession(sessionID);
+    }
+
+    // Called by the router once a channel has resolved to a session (existing
+    // binding or auto-bind). Records session->channel for typing, then subscribes
+    // it -- the INCREMENTAL path for a session bound after boot (auto-bind INSERT),
+    // not the only path (subscribeTypingFromBindings above is the boot path).
     async function noteSessionBound({ sessionID, channelID }) {
       if (!sessionID || !channelID) return;
       // Fresh rows FIRST: this runs on the inbound path right after the binding
@@ -225,15 +291,7 @@ export function setup(provide) {
       sessionChannelID.set(String(sessionID), String(channelID));
       if (!channelBotKey.has(String(channelID)))
         channelBotKey.set(String(channelID), LEGACY_BOT_KEY);
-      if (typeof subscribe !== 'function' || typingSubscribedSessions.has(String(sessionID)))
-        return;
-      typingSubscribedSessions.add(String(sessionID));
-      try {
-        await subscribe(typingIndicator.onEvent, { sessions: [String(sessionID)] });
-      } catch (error) {
-        typingSubscribedSessions.delete(String(sessionID));
-        console.warn('[discord] could not subscribe the typing indicator: ' + String(error?.message || error));
-      }
+      await subscribeTypingSession(sessionID);
     }
 
     // Ed25519 verification of X-Signature-Ed25519 over timestamp+body.
@@ -1380,7 +1438,14 @@ export function setup(provide) {
     // Returned as an object, not a function: loadPlugins treats a returned function as a
     // teardown and would silently skip onInit and onShutdown.
     return {
-      onInit() { return gatewayLoop(); },
+      async onInit() {
+        // Bindings FIRST: loadChannelBindings subscribes typing to every row it
+        // reads, so the indicator's sessions are known before the gateway can
+        // route a single frame -- with no inbound message required (the root-cause
+        // fix; the not-ready window retries from gatewayLoop's refreshInboundConfig).
+        await loadChannelBindings();
+        return gatewayLoop();
+      },
       onShutdown() {
         stopped = true;
         if (heartbeat) clearInterval(heartbeat);
